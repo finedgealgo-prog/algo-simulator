@@ -42,7 +42,7 @@ from pymongo import MongoClient
 
 from features import auth as app_auth
 from features.mongo_data import MongoData
-from features.simulator_risk_monitor import simulator_risk_monitor
+from simulator_risk_monitor import simulator_risk_monitor
 from .models import MiniStrangleRequest
 from .monitor_service import get_simulator_monitor_service
 from .monitor_ui import build_monitor_toggle_page

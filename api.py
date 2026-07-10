@@ -59,7 +59,7 @@ from features.broker_gateway import (
     broker_ticker_manager           as ticker_manager,
 )
 from features.mock_ticker import mock_ticker_manager
-from features.simulator_risk_monitor import simulator_risk_monitor
+from simulator_risk_monitor import simulator_risk_monitor
 from simulator.api_server import router as simulator_router
 from simulator.models import MiniStrangleRequest
 from simulator.monitor_service import get_simulator_monitor_service
@@ -1396,19 +1396,6 @@ sim_router = APIRouter()   # simulator routes live at /simulator/... (no extra p
 # (that stays algo.trade-only); commodities/indices is everything this needs.
 from features.dhan_token_sync import router as dhan_token_sync_router  # noqa: E402
 app.include_router(dhan_token_sync_router)
-
-
-class RegisterIn(BaseModel):
-    mobile: str
-    name: str
-    email: str
-    password: str
-    referral_code: Optional[str] = None
-
-
-class LoginIn(BaseModel):
-    mobile: str
-    password: str
 
 
 class PTPortfolioIn(BaseModel):
