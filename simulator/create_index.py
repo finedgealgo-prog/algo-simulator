@@ -10,8 +10,10 @@ Usage:
 from pymongo import ASCENDING, MongoClient
 import time
 
+from features.mongo_data import MONGO_URI
 
-def create_index(mongo_uri: str = "mongodb://localhost:27017/") -> None:
+
+def create_index(mongo_uri: str = MONGO_URI) -> None:
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
     col = client["stock_data"]["option_chain_historical_data"]
 

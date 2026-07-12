@@ -1,1 +1,1 @@
-../algo.chart/chart_api.py
+../shared/chart_api.py

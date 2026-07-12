@@ -38,7 +38,6 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-from pymongo import MongoClient
 
 from features import auth as app_auth
 from features.mongo_data import MongoData
@@ -57,8 +56,8 @@ from .streaming_controller import StreamingController
 from .zerodha_broker import ZerodhaBroker
 
 _broker = ZerodhaBroker()
-_mongo_client = MongoClient("mongodb://localhost:27017/")
-_stock_db = _mongo_client["stock_data"]
+_shared_mongo = MongoData()
+_stock_db = _shared_mongo._db
 _holiday_collection = _stock_db["market_holidays"]
 _option_chain_collection = _stock_db["option_chain_historical_data"]
 _simulator_portfolio_col = _stock_db["simulator_portfolio"]

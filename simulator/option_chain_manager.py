@@ -32,6 +32,8 @@ from typing import Optional
 
 from pymongo import MongoClient
 
+from features.mongo_data import MONGO_URI
+
 from .market_calendar import MarketCalendar
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 class OptionChainManager:
 
-    def __init__(self, mongo_uri: str = "mongodb://localhost:27017/"):
+    def __init__(self, mongo_uri: str = MONGO_URI):
         self._client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         self._collection = self._client["stock_data"]["option_chain"]
         self._calendar = MarketCalendar(mongo_uri)
