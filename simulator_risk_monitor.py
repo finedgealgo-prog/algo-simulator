@@ -11,10 +11,11 @@ collections, different UI, no shared task, no shared state. The only
 cross-module calls are read-only reuse of
 features.execution_socket._fetch_dhan_broker_option_positions() (already the
 canonical "what's open + is the saved trigger still valid" lookup, used by
-three existing endpoints) and a direct in-process call into
-api.py's simulator_place_manual_order() to fire a real exit order — the same
-function /trade/positions/place-order already uses, so live vs. paper/demo
-broker routing is whatever that function already does today, untouched here.
+three existing endpoints) and a call into api.py's
+_place_manual_order_via_order_service() to fire a real exit order — this box
+isn't the one whitelisted with the broker for live order placement, so that
+call goes out over HTTP to algo.order's internal gateway (the box that is)
+rather than placing the order in-process here.
 
 Architecture — hot loop vs warm refresh (see plan doc for the full rationale):
   - Hot tick, every HOT_TICK_SECONDS: pure in-memory dict/arithmetic against
@@ -1699,7 +1700,7 @@ class SimulatorRiskMonitor:
             await self._persist_hedge_state(db, broker_id, underlying, today, [{'option_type': 'ALERT_ONLY_MARKER'}])
             return
 
-        from api import ManualOrderLeg, ManualOrderRequest, get_live_greeks_chain, simulator_place_manual_order  # type: ignore
+        from api import ManualOrderLeg, get_live_greeks_chain, _place_manual_order_via_order_service  # type: ignore
 
         try:
             chain_payload = await get_live_greeks_chain(underlying, expiry='')
@@ -1732,7 +1733,7 @@ class SimulatorRiskMonitor:
             f'CE={ce_row.get("strike")} PE={pe_row.get("strike")} qty={lot_size} mode={mode}', flush=True,
         )
         try:
-            result = await simulator_place_manual_order(ManualOrderRequest(broker_id=broker_id, orders=order_legs))
+            result = await _place_manual_order_via_order_service(broker_id, order_legs)
         except Exception as exc:
             self.last_error = f'hedge entry error broker={broker_id} {underlying}: {exc}'
             log.error('[SIMULATOR RISK MONITOR] %s', self.last_error)
@@ -1766,7 +1767,7 @@ class SimulatorRiskMonitor:
             await self._persist_hedge_state(db, broker_id, underlying, active_date, [])
             return
 
-        from api import ManualOrderLeg, ManualOrderRequest, get_live_greeks_chain, simulator_place_manual_order  # type: ignore
+        from api import ManualOrderLeg, get_live_greeks_chain, _place_manual_order_via_order_service  # type: ignore
 
         # hedge_legs (persisted at entry) carries no live price — re-fetch the chain so
         # MPP has a sane fallback price if its own live-quote lookup ever misses.
@@ -1793,7 +1794,7 @@ class SimulatorRiskMonitor:
         ]
         print(f'[SIMULATOR RISK MONITOR] \U0001F6E1️ HEDGE EXIT firing broker={broker_label} {underlying} legs={len(order_legs)}', flush=True)
         try:
-            result = await simulator_place_manual_order(ManualOrderRequest(broker_id=broker_id, orders=order_legs))
+            result = await _place_manual_order_via_order_service(broker_id, order_legs)
         except Exception as exc:
             self.last_error = f'hedge exit error broker={broker_id} {underlying}: {exc}'
             log.error('[SIMULATOR RISK MONITOR] %s', self.last_error)
@@ -1923,7 +1924,12 @@ class SimulatorRiskMonitor:
         try:
             positions = (adj_doc or {}).get('positions') or []
             if positions and AUTO_FIRE_ENABLED:
-                from api import ManualOrderLeg, ManualOrderRequest, simulator_place_manual_order  # type: ignore
+                # _place_manual_order_via_order_service (not simulator_place_manual_order/
+                # _simulator_place_manual_order_core in-process) — this box isn't the one
+                # whitelisted with Dhan for live order placement, only algo.order's box is.
+                # Routing through algo.order's internal gateway means the actual broker call
+                # happens on ITS box regardless of this monitor firing here.
+                from api import ManualOrderLeg, _place_manual_order_via_order_service  # type: ignore
                 order_legs = []
                 for p in positions:
                     tag = str(p.get('tag') or 'EXIT')
@@ -1943,7 +1949,7 @@ class SimulatorRiskMonitor:
                     ))
                 if order_legs:
                     try:
-                        result = await simulator_place_manual_order(ManualOrderRequest(broker_id=broker_id, orders=order_legs))
+                        result = await _place_manual_order_via_order_service(broker_id, order_legs)
                         self.last_fire = {
                             'broker_id': broker_id, 'reason': f'adjustment_{fired_condition}',
                             'legs': len(order_legs), 'at': _now_iso(), 'result': result,
@@ -2322,7 +2328,7 @@ class SimulatorRiskMonitor:
                     self.registry.in_flight.discard(str(leg.get('token') or ''))
 
     async def _fire_exit_for_broker(self, db: MongoData, broker_id: str, broker_legs: list[dict]) -> None:
-        from api import ManualOrderLeg, ManualOrderRequest, simulator_place_manual_order  # type: ignore
+        from api import ManualOrderLeg, _place_manual_order_via_order_service  # type: ignore
 
         order_legs = [
             ManualOrderLeg(
@@ -2349,11 +2355,11 @@ class SimulatorRiskMonitor:
             broker_id, broker_legs[0].get('_reason'), [o.model_dump() for o in order_legs],
         )
         try:
-            # simulator_place_manual_order (api.py) already sends its own
-            # Telegram notification for the order's success/error/partial
-            # result — only the unexpected-exception backstop below needs
-            # one of its own.
-            result = await simulator_place_manual_order(ManualOrderRequest(broker_id=broker_id, orders=order_legs))
+            # The internal /internal/place-order gateway (algo.order) already sends
+            # its own Telegram notification for the order's success/error/partial
+            # result — only the unexpected-exception backstop below needs one of
+            # its own.
+            result = await _place_manual_order_via_order_service(broker_id, order_legs)
         except Exception as exc:
             self.last_error = f'fire_exit error broker={broker_id}: {exc}'
             log.error('[SIMULATOR RISK MONITOR] %s', self.last_error)

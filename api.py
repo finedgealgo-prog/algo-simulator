@@ -3423,6 +3423,106 @@ async def simulator_positions_by_broker(body: SimulatorBrokerPositionsRequest, c
         }
 
 
+class SensibullHallOfFameTokenRequest(BaseModel):
+    access_token: str
+
+
+class HallOfFameFavoriteRequest(BaseModel):
+    word_hash: str
+    name: str = ""
+    user_name: str = ""
+    profile_image_url: str = ""
+    followers_count: float | None = None
+    live_since: str | None = None
+    total_profit: float | None = None
+    roi: float | None = None
+    total_capital: float | None = None
+
+
+@sim_router.get("/simulator/sensibull-hall-of-fame")
+async def simulator_sensibull_hall_of_fame(
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=10, ge=1, le=50),
+    sort_by: str = Query(default="pl_desc"),
+    search_term: str = Query(default=""),
+    is_following: bool = Query(default=False),
+    current_user: dict = Depends(app_auth.get_current_user),
+) -> dict:
+    from features.sensibull_hall_of_fame import fetch_hall_of_fame
+
+    return await asyncio.to_thread(
+        fetch_hall_of_fame, _shared_mongo, page, per_page, sort_by, search_term, is_following
+    )
+
+
+@sim_router.get("/simulator/sensibull-hall-of-fame/positions/{word_hash}")
+async def simulator_sensibull_hall_of_fame_positions(
+    word_hash: str, current_user: dict = Depends(app_auth.get_current_user)
+) -> dict:
+    from features.sensibull_hall_of_fame import fetch_live_positions_snapshot
+
+    return await asyncio.to_thread(fetch_live_positions_snapshot, _shared_mongo, word_hash)
+
+
+@sim_router.get("/simulator/sensibull-hall-of-fame/favorites")
+async def simulator_sensibull_hall_of_fame_favorites(
+    current_user: dict = Depends(app_auth.get_current_user),
+) -> dict:
+    from features.sensibull_hall_of_fame import fetch_hall_of_fame_favorites
+
+    return await asyncio.to_thread(fetch_hall_of_fame_favorites, _shared_mongo)
+
+
+# This app's own per-user favorites (see hall_of_fame_favorites collection) — distinct from
+# the Sensibull-account-level favorites read above, which we have no write access to.
+@sim_router.get("/simulator/hall-of-fame/favorites")
+async def simulator_hall_of_fame_list_favorites(
+    current_user: dict = Depends(app_auth.get_current_user),
+) -> dict:
+    from features.sensibull_hall_of_fame import list_app_favorites
+
+    return await asyncio.to_thread(list_app_favorites, _shared_mongo, _resolve_sim_user_id(current_user))
+
+
+@sim_router.post("/simulator/hall-of-fame/favorites")
+async def simulator_hall_of_fame_add_favorite(
+    req: HallOfFameFavoriteRequest, current_user: dict = Depends(app_auth.get_current_user)
+) -> dict:
+    from features.sensibull_hall_of_fame import add_app_favorite
+
+    return await asyncio.to_thread(add_app_favorite, _shared_mongo, _resolve_sim_user_id(current_user), req.dict())
+
+
+@sim_router.delete("/simulator/hall-of-fame/favorites/{word_hash}")
+async def simulator_hall_of_fame_remove_favorite(
+    word_hash: str, current_user: dict = Depends(app_auth.get_current_user)
+) -> dict:
+    from features.sensibull_hall_of_fame import remove_app_favorite
+
+    return await asyncio.to_thread(remove_app_favorite, _shared_mongo, _resolve_sim_user_id(current_user), word_hash)
+
+
+@sim_router.post("/simulator/sensibull-hall-of-fame/token")
+async def simulator_sensibull_hall_of_fame_set_token(
+    req: SensibullHallOfFameTokenRequest, current_user: dict = Depends(app_auth.require_current_user)
+) -> dict:
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from features.sensibull_hall_of_fame import set_hall_of_fame_token
+
+    set_hall_of_fame_token(_shared_mongo, req.access_token)
+    return {"status": "ok"}
+
+
+@sim_router.get("/simulator/sensibull-hall-of-fame/token/status")
+async def simulator_sensibull_hall_of_fame_token_status(
+    current_user: dict = Depends(app_auth.get_current_user),
+) -> dict:
+    from features.sensibull_hall_of_fame import get_hall_of_fame_token_status
+
+    return await asyncio.to_thread(get_hall_of_fame_token_status, _shared_mongo)
+
+
 _manual_order_kite_cache: dict[tuple, dict] = {}
 _manual_order_kite_cache_date: str = ""
 
@@ -3753,6 +3853,7 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     price=price,
                     trigger_price=leg.trigger_price or 0.0,
                     context={"purpose": "manual_order_pad", "broker": "dhan", "symbol": resolved["symbol"]},
+                    broker_kwargs={"security_id": resolved["security_id"], "exchange_segment": resolved["exchange_segment"]},
                 )
                 if result["status"] != "success":
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
@@ -3760,12 +3861,18 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 # quote, not the leg's own (possibly stale/zero) price — callers that persist a
                 # position snapshot (e.g. _simulator_pt_webhook_create_strategy) use this as the
                 # real entry_price instead of whatever was showing when the webhook was generated.
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price,
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            # Every leg in the basket fires at once instead of waiting on the previous leg's
-            # broker round-trip — for a multi-leg strategy that's the difference between the
-            # whole basket landing together vs. legs getting staggered fills at drifting prices.
-            dhan_results: list[dict] = await asyncio.gather(*(_place_one_dhan_leg(leg) for leg in body.orders))
+            # BUY legs place first (as one batch), then SELL legs (as a second batch) —
+            # see place_legs_hedge_ordered's docstring: gives the broker a real BUY
+            # position ahead of the SELL leg instead of both sides landing at once.
+            from features.order_execution import place_legs_hedge_ordered
+            dhan_results: list[dict] = await place_legs_hedge_ordered(body.orders, _place_one_dhan_leg)
 
             any_ok = any(r["status"] == "success" for r in dhan_results)
             all_ok = bool(dhan_results) and all(r["status"] == "success" for r in dhan_results)
@@ -3856,11 +3963,16 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
                 # See the Dhan branch's identical comment — price is the MPP/LTP-resolved fresh
                 # quote actually submitted, not leg.price.
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price,
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            # Whole basket fires together instead of one leg waiting on the previous leg's
-            # broker round-trip — same reasoning as the Dhan branch above.
-            results = await asyncio.gather(*(_place_one_flattrade_leg(leg) for leg in body.orders))
+            # BUY-then-SELL batching — same reasoning as the Dhan branch above.
+            from features.order_execution import place_legs_hedge_ordered
+            results = await place_legs_hedge_ordered(body.orders, _place_one_flattrade_leg)
         else:
             from kiteconnect import KiteConnect  # type: ignore
 
@@ -3932,11 +4044,16 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
                 # See the Dhan branch's identical comment — price is the MPP/LTP-resolved fresh
                 # quote actually submitted, not leg.price.
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"], "price": price,
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            # Whole basket fires together instead of one leg waiting on the previous leg's
-            # broker round-trip — same reasoning as the Dhan branch above.
-            results = await asyncio.gather(*(_place_one_kite_leg(leg) for leg in body.orders))
+            # BUY-then-SELL batching — same reasoning as the Dhan branch above.
+            from features.order_execution import place_legs_hedge_ordered
+            results = await place_legs_hedge_ordered(body.orders, _place_one_kite_leg)
 
         any_ok = any(r["status"] == "success" for r in results)
         all_ok = bool(results) and all(r["status"] == "success" for r in results)
@@ -3949,6 +4066,40 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
     except Exception as exc:
         print(f"[PLACE_ORDER] unhandled error={exc}", flush=True)
         return {"status": "error", "message": str(exc), "results": []}
+
+
+async def _place_manual_order_via_order_service(broker_id: str, orders: list["ManualOrderLeg"]) -> dict:
+    """
+    Calls algo.order's internal /internal/place-order gateway instead of running
+    _simulator_place_manual_order_core in-process on this box. That function talks
+    to the broker directly from whichever box calls it, and this box (algo.simulator,
+    13.206.220.19) isn't the one whitelisted with Dhan for live order placement —
+    only algo.order's box (13.202.184.58) is. Routing through algo.order means the
+    actual broker call happens on ITS box regardless of which webhook/monitor here
+    initiated it. Used by webhook-triggered strategy creation/adjustment firing and
+    by simulator_risk_monitor.py's automatic SL/TG adjustment firing — anywhere a
+    live order gets placed with no logged-in user's JWT to send.
+
+    Returns the exact same {"status", "message"?, "results"} shape
+    _simulator_place_manual_order_core itself returns, so callers don't need to
+    change beyond swapping which function they call.
+    """
+    import requests
+    from features.live_order_manager import ORDER_SERVICE_URL, _INTERNAL_HEADERS
+
+    try:
+        resp = await asyncio.to_thread(
+            requests.post,
+            f"{ORDER_SERVICE_URL}/internal/place-order",
+            json={"broker_id": broker_id, "orders": [o.model_dump() for o in orders]},
+            headers=_INTERNAL_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        print(f"[PLACE_ORDER] internal gateway call failed: {exc}", flush=True)
+        return {"status": "error", "message": f"Order service call failed: {exc}", "results": []}
 
 
 @sim_router.post("/trade/positions/place-order")
@@ -4912,7 +5063,7 @@ async def _simulator_pt_webhook_create_strategy(webhook_doc: dict) -> dict:
         if not orders:
             return {"status": "error", "message": "No open legs to trade."}
 
-        order_result = await _simulator_place_manual_order_core(ManualOrderRequest(broker_id=broker_id, orders=orders))
+        order_result = await _place_manual_order_via_order_service(broker_id, orders)
         if order_result.get("status") not in ("success", "partial"):
             return {"status": "error", "message": order_result.get("message") or "Order placement failed.", "results": order_result.get("results")}
         extra_fields["broker_id"] = broker_id
@@ -5179,7 +5330,7 @@ async def _simulator_pt_webhook_fire_live_adjustment(webhook_doc: dict) -> dict:
         )
         for p in open_positions
     ]
-    order_result = await _simulator_place_manual_order_core(ManualOrderRequest(broker_id=broker_id, orders=orders))
+    order_result = await _place_manual_order_via_order_service(broker_id, orders)
     now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
     if order_result.get("status") not in ("success", "partial"):
         message = order_result.get("message") or "Order placement failed."
@@ -6522,10 +6673,26 @@ def _sim_find_plan(value: Optional[str]) -> Optional[dict]:
     return plans_col.find_one({"slug": value})
 
 
+_sim_subscription_plans_seeded = False
+
+
 def _seed_sim_subscription_plans_if_empty() -> None:
+    # This does a full migration scan + per-doc update_one() over
+    # sim_user_subscriptions/sim_subscription_plans — fine as a one-time
+    # self-heal, but it used to run on every single call to any of the 7
+    # subscription endpoints that invoke this function, re-scanning both
+    # collections per request. With Mongo on a separate box (cross-AZ
+    # latency) and N individual update_one() round-trips, that turned every
+    # subscription-plans/my-plan page load into a ~28s hang. A process-level
+    # guard makes it actually run once per process instead.
+    global _sim_subscription_plans_seeded
+    if _sim_subscription_plans_seeded:
+        return
+
     col = _shared_mongo._db["sim_subscription_plans"]
     if col.count_documents({}) == 0:
         col.insert_many([dict(p) for p in _SIM_DEFAULT_PLANS])
+        _sim_subscription_plans_seeded = True
         return
 
     # ── One-time migration: plan_id (string slug) -> real Mongo _id ────────
@@ -6590,22 +6757,40 @@ def _seed_sim_subscription_plans_if_empty() -> None:
         if update:
             col.update_one({"_id": existing["_id"]}, update)
 
+    _sim_subscription_plans_seeded = True
+
 
 @sim_router.get("/simulator/subscription/plans")
-async def simulator_subscription_plans() -> list[dict[str, Any]]:
+def simulator_subscription_plans() -> list[dict[str, Any]]:
+    # Plain def (not async def) — every call in this body is blocking
+    # pymongo I/O with no await, so as `async def` it was running straight on
+    # the event loop and stalling every other in-flight request (regardless
+    # of route) for its duration. `def` lets FastAPI offload it to its
+    # threadpool instead, same as payment.py's get_subscriptions.
     """Public — no auth. Plan catalogue only, never user-specific data."""
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
     _seed_sim_subscription_plans_if_empty()
+    print(f"[TIMING subscription/plans] seed check done t={_t.perf_counter()-_t0:.3f}s")
     col = _shared_mongo._db["sim_subscription_plans"]
-    return [_sim_plan_public(d) for d in col.find({}).sort("sort_order", 1)]
+    result = [_sim_plan_public(d) for d in col.find({}).sort("sort_order", 1)]
+    print(f"[TIMING subscription/plans] EXIT t={_t.perf_counter()-_t0:.3f}s")
+    return result
 
 
 @sim_router.get("/simulator/subscription/my-plan")
-async def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.require_current_user)) -> dict[str, Any]:
+def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.require_current_user)) -> dict[str, Any]:
+    # Plain def — see simulator_subscription_plans above for why.
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    print(f"[TIMING subscription/my-plan] ENTER (auth already resolved) t=0.000s")
     _seed_sim_subscription_plans_if_empty()
+    print(f"[TIMING subscription/my-plan] seed check done t={_t.perf_counter()-_t0:.3f}s")
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
 
     user_id = _resolve_sim_user_id(current_user)
     sub_doc = subs_col.find_one(_sim_user_or_filter(user_id), sort=[("_id", -1)]) if user_id else None
+    print(f"[TIMING subscription/my-plan] find_one sub_doc done t={_t.perf_counter()-_t0:.3f}s")
 
     sub_status = _sim_sub_effective_status(sub_doc)
     is_active_sub = sub_status == SIM_SUB_STATUS_ACTIVE
@@ -6633,6 +6818,7 @@ async def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.r
     # always match even though the plan itself is still Free.
     status = "free" if plan.get("slug") == "free" else ("expired" if sub_status == SIM_SUB_STATUS_EXPIRED else "active")
 
+    print(f"[TIMING subscription/my-plan] EXIT t={_t.perf_counter()-_t0:.3f}s")
     return {
         "plan_id": str(plan.get("_id", "")),
         "plan_name": plan["plan_name"],
