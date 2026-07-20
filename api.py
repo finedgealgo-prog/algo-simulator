@@ -62,6 +62,8 @@ from features.mock_ticker import mock_ticker_manager
 from simulator_risk_monitor import simulator_risk_monitor
 from simulator.api_server import router as simulator_router
 from simulator.models import MiniStrangleRequest
+from simulator.strangle_daily.models import StrangleDailyRequest
+from simulator.strangle_daily.engine import run_backtest as run_strangle_daily_backtest
 from simulator.monitor_service import get_simulator_monitor_service
 from simulator.monitor_ui import build_monitor_toggle_page
 from simulator.strategy_monitor_bridge import (
@@ -1693,7 +1695,7 @@ def _resolve_pt_position_token(position: dict, instrument: str = "") -> str:
         return ""
 
 
-def _enrich_pt_strategy_positions(strategy_doc: dict) -> dict:
+def _enrich_pt_strategy_positions(strategy_doc: dict, allow_rest_fallback: bool = True) -> dict:
     enriched = dict(strategy_doc or {})
     instrument = str(enriched.get("instrument") or "").strip().upper()
 
@@ -1764,11 +1766,17 @@ def _enrich_pt_strategy_positions(strategy_doc: dict) -> dict:
                     except Exception:
                         pass
 
-        # Collect all broker tokens for REST fallback
+        # Collect all broker tokens for REST fallback. REST quotes are gated by
+        # a global cross-process Mongo clock (~1.05s/call, see
+        # wait_for_dhan_slot in broker_gateway.py) — fine for a single-strategy
+        # detail view, but a list view calling this once per strategy would
+        # serialize N REST calls and turn an instant list into an N-second one.
+        # List callers pass allow_rest_fallback=False and just take whatever
+        # the (non-blocking) WS ltp map already has.
         all_broker_tokens = list({bt for bt in broker_token_for.values() if bt})
         missing_ltp = [t for t in all_broker_tokens if not ws_ltp.get(t)]
         rest_quotes: dict = {}
-        if missing_ltp:
+        if missing_ltp and allow_rest_fallback:
             try:
                 rest_quotes = get_broker_rest_quotes(missing_ltp, _shared_mongo._db, ws_seg_for)
             except Exception:
@@ -2967,6 +2975,12 @@ async def simulator_stop_mini_strangle(session_id: str) -> dict:
 @sim_router.get("/simulator/mini-strangle/sessions")
 async def simulator_list_sessions() -> dict:
     return {"active_sessions": list(_simulator_sessions.keys()), "count": len(_simulator_sessions)}
+
+
+@sim_router.post("/simulator/strangle-daily/backtest")
+async def simulator_strangle_daily_backtest(request: StrangleDailyRequest) -> dict:
+    result = await asyncio.to_thread(run_strangle_daily_backtest, request)
+    return result.model_dump()
 
 
 @sim_router.get("/simulator/monitor/start")
@@ -5458,7 +5472,7 @@ async def simulator_pt_list_strategies(
         docs = list(_shared_mongo._db["simulator_strategy"].find(filt).sort("saved_at", -1))
         result = []
         for doc in docs:
-            doc = _enrich_pt_strategy_positions(doc)
+            doc = _enrich_pt_strategy_positions(doc, allow_rest_fallback=False)
             doc["_id"] = str(doc["_id"])
             positions = doc.get("positions", [])
             doc["position_count"] = len(positions)
@@ -5487,6 +5501,28 @@ async def simulator_pt_list_strategies(
             doc["open_positions"] = open_positions
             result.append(doc)
         return {"status": "success", "strategies": result}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+# Registered before /simulator/paper-trade/strategies/{strategy_id} (below) so FastAPI's
+# first-match routing doesn't swallow "count" as a strategy_id path param.
+@sim_router.get("/simulator/paper-trade/strategies/count")
+async def simulator_pt_count_strategies(current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Lightweight count for the paper-trade plan-limit gate (PaperTradeNew's
+    active_strategy_limit check) — that check only ever needs `len(strategies)`,
+    so it used to pull the *full* list endpoint (every doc, every position,
+    LTP enrichment) just to throw the data away and keep a number. This does
+    the same user-scoped count server-side via count_documents instead of
+    materializing and transferring every strategy doc over the wire.
+    """
+    try:
+        _ensure_simulator_strategy_index()
+        current_user_id = _resolve_sim_user_id(current_user)
+        filt = {"$or": [{"user_id": current_user_id}, {"user_id": {"$exists": False}}]}
+        count = _shared_mongo._db["simulator_strategy"].count_documents(filt)
+        return {"status": "success", "count": count}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -7591,6 +7627,20 @@ def _ensure_simulator_strategy_index() -> None:
         _shared_mongo._db["simulator_strategy"].create_index(
             [("user_id", 1), ("all_exited", 1)],
             name="idx_simulator_strategy_user_v1",
+        )
+    except Exception:
+        pass
+    try:
+        # simulator_pt_list_strategies filters by portfolio_id (or
+        # portfolio_name) + user_id — without this the query above doesn't
+        # cover it and falls back to a full collection scan.
+        _shared_mongo._db["simulator_strategy"].create_index(
+            [("portfolio_id", 1), ("user_id", 1)],
+            name="idx_simulator_strategy_portfolio_v1",
+        )
+        _shared_mongo._db["simulator_strategy"].create_index(
+            [("portfolio_name", 1), ("user_id", 1)],
+            name="idx_simulator_strategy_portfolio_name_v1",
         )
     except Exception:
         pass
