@@ -3705,6 +3705,11 @@ async def _fetch_dhan_quote_for_leg(leg: "ManualOrderLeg", raw_db, prefetched: d
         "ltp": float(quote.get("ltp") or 0),
         "bid": float(quote.get("bid") or 0),
         "ask": float(quote.get("ask") or 0),
+        # Full depth (best→worst) when available — see _fetch_dhan_market_data. WS-sourced
+        # quotes only ever have 1 level (Dhan's other 4 WS depth levels aren't parsed); REST
+        # quotes carry whatever Dhan's /marketfeed/quote returns (typically 5).
+        "bid_depth": quote.get("bid_depth") or ([{"price": float(quote.get("bid") or 0), "quantity": 0}] if quote.get("bid") else []),
+        "ask_depth": quote.get("ask_depth") or ([{"price": float(quote.get("ask") or 0), "quantity": 0}] if quote.get("ask") else []),
         # "ws" (in-memory, ~instant) / "rest" (Dhan API round trip, rate-gated) / "cache"
         # (last-good fallback) / absent if no quote at all — see _fetch_dhan_market_data.
         "source": quote.get("source"),
@@ -3727,9 +3732,15 @@ def _notify_mpp_ltp_price_unresolved(kind: str, message: str) -> None:
 
 async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, prefetched: dict[str, dict] | None = None) -> float:
     """
-    MPP's bid + protection% / ask - protection% formula, priced off Dhan's feed regardless of
-    the execution broker (see _fetch_dhan_quote_for_leg). The order itself still goes out
+    MPP's walked-depth + protection% formula, priced off Dhan's feed regardless of the
+    execution broker (see _fetch_dhan_quote_for_leg). The order itself still goes out
     through whichever broker/symbol the caller resolved separately.
+
+    Prices off the side this leg's qty actually has to sweep to fill — a BUY matches
+    against resting ASK orders, a SELL matches against resting BID orders, not the leg's
+    own resting side — and walks that side's depth levels (best→worst) until leg.quantity
+    is covered, instead of assuming the top level alone holds the whole order. Same
+    reasoning as live_order_manager.py's place_live_entry_order/place_live_exit_order.
 
     Returns 0.0 — NEVER leg.price or ltp as a stand-in for a missing bid/ask — when Dhan has
     no contract match or no live depth on the side this leg needs. Every caller (see
@@ -3741,7 +3752,7 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, prefetched: dict[str
     prefetched: see _fetch_dhan_quote_for_leg — pass _prefetch_dhan_quotes_for_legs' result
     when pricing every leg of the same basket, so they share one REST call instead of one each.
     """
-    from features.live_order_manager import _mpp_protection_pct, _clamp_limit_price
+    from features.live_order_manager import _mpp_protection_pct, _clamp_limit_price, _walk_depth_for_qty
 
     quote = await _fetch_dhan_quote_for_leg(leg, raw_db, prefetched)
     if not quote:
@@ -3751,27 +3762,34 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, prefetched: dict[str
         return 0.0
 
     ltp = quote["ltp"]
-    bid = quote["bid"]
-    ask = quote["ask"]
     is_buy = leg.side == "BUY"
-    # Only the side this order actually needs (bid for BUY, ask for SELL) has to be live —
-    # but never substitute ltp for it if it's missing.
-    if (is_buy and bid <= 0) or (not is_buy and ask <= 0):
+    consume_side = quote["ask_depth"] if is_buy else quote["bid_depth"]
+    walked_price, fully_covered = _walk_depth_for_qty(consume_side, leg.quantity)
+    # Never substitute ltp for missing depth — that isn't a live book price and would place
+    # a real order at a fabricated "protected" price with no depth behind it.
+    if walked_price <= 0:
         _notify_mpp_ltp_price_unresolved(
             "MPP",
-            f"No live depth for {quote.get('symbol')} (bid={bid}, ask={ask}) — order NOT placed.",
+            f"No live depth for {quote.get('symbol')} (side={'ask' if is_buy else 'bid'}, qty={leg.quantity}) — order NOT placed.",
         )
         return 0.0
+    if not fully_covered:
+        print(
+            f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} qty={leg.quantity} not fully covered by visible "
+            f"{'ask' if is_buy else 'bid'}-side depth — pricing off deepest visible level {walked_price}, "
+            f"remainder may not fill immediately.",
+            flush=True,
+        )
 
     # NSE's MPP protection band is sized differently for options vs futures (tighter for
     # futures — see _mpp_protection_pct's docstring) — a futures leg must not get priced
     # with the wider option band.
     pct = _mpp_protection_pct(ltp, is_option=leg.option_type.strip().upper() != "FUT")
-    base_price = bid if is_buy else ask
-    raw_price = base_price * (1 + pct / 100) if is_buy else base_price * (1 - pct / 100)
+    raw_price = walked_price * (1 + pct / 100) if is_buy else walked_price * (1 - pct / 100)
     price = _clamp_limit_price(raw_price, is_buy)
     print(
-        f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} source={quote.get('source')} ltp={ltp} bid={bid} ask={ask} "
+        f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} source={quote.get('source')} ltp={ltp} "
+        f"qty={leg.quantity} walked_price={walked_price} fully_covered={fully_covered} "
         f"pct={pct}% price={price} is_buy={is_buy}",
         flush=True,
     )
@@ -3815,13 +3833,29 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
     try:
         raw_db = _shared_mongo._db
 
-        dhan_cfg = raw_db["kite_market_config"].find_one({"broker": "dhan"}) or {}
-        if broker_id and broker_id == str(dhan_cfg.get("_id") or "").strip():
+        # Looked up by _id (the specific account the user picked), not just "any doc with
+        # broker=dhan" — kite_market_config can hold one Dhan doc per user, so matching on
+        # broker alone would silently route every user's order through whichever Dhan doc
+        # Mongo happened to return first instead of the one this broker_id actually names.
+        dhan_cfg = {}
+        if broker_id:
+            try:
+                from bson import ObjectId
+                dhan_cfg = raw_db["kite_market_config"].find_one({"_id": ObjectId(broker_id), "broker": "dhan"}) or {}
+            except Exception:
+                dhan_cfg = {}
+        if dhan_cfg:
             dhan_client_id = str(dhan_cfg.get("user_id") or dhan_cfg.get("dhan_client_id") or "").strip()
             dhan_access_token = str(dhan_cfg.get("access_token") or "").strip()
             if not dhan_access_token or not dhan_client_id:
                 print("[PLACE_ORDER][dhan] credentials not configured", flush=True)
                 return {"status": "error", "message": "Dhan credentials not configured.", "results": []}
+
+            try:
+                from features.dhan_order_update import dhan_order_update_pool
+                dhan_order_update_pool.ensure_started(dhan_client_id, dhan_access_token)
+            except Exception:
+                log.warning("[PLACE_ORDER][dhan] order-update WS warm-start failed", exc_info=True)
 
             from features.dhan_broker import get_dhan_instance
             from features.order_execution import place_broker_order
@@ -10480,11 +10514,20 @@ def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, d
                 # a token was never subscribed in Full mode (e.g. chain-warming-only ticks).
                 ws_bid = float(_dtm.bid_map.get(sid_str) or 0)
                 ws_ask = float(_dtm.ask_map.get(sid_str) or 0)
+                # Level-0 qty only — the WS Full packet's other 4 depth levels aren't parsed
+                # (see dhan_ticker.py's _FULL_DEPTH_L0 comment), so this is "how much is
+                # available at the best price," not the whole book. _walk_dhan_depth_for_qty
+                # treats a qty bigger than this as "not fully covered" and falls back to REST
+                # depth (which does have all 5 levels) rather than trusting a single level.
+                ws_bid_qty = int(_dtm.bid_qty_map.get(sid_str) or 0)
+                ws_ask_qty = int(_dtm.ask_qty_map.get(sid_str) or 0)
                 result[sid_str] = {
                     "ltp": ws_ltp,
                     "oi": int(_dtm.oi_map.get(sid_str) or cached.get("oi", 0)),
                     "bid": ws_bid or cached.get("bid", 0.0),
                     "ask": ws_ask or cached.get("ask", 0.0),
+                    "bid_depth": [{"price": ws_bid, "quantity": ws_bid_qty}] if ws_bid > 0 else cached.get("bid_depth", []),
+                    "ask_depth": [{"price": ws_ask, "quantity": ws_ask_qty}] if ws_ask > 0 else cached.get("ask_depth", []),
                     "prev_close": cached.get("prev_close", 0.0),
                     # Lets callers (see _fetch_dhan_quote_for_leg) log/print which path actually
                     # priced this leg — "ws" (in-memory, ~instant) vs "rest" vs "cache" below.
@@ -10533,6 +10576,18 @@ def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, d
                                 # Best bid/ask (level 0) — 0 if that side of the book is empty.
                                 "bid": float((buy_levels[0] or {}).get("price") or 0) if buy_levels else 0.0,
                                 "ask": float((sell_levels[0] or {}).get("price") or 0) if sell_levels else 0.0,
+                                # Full depth (all levels Dhan returns, best→worst) — lets
+                                # _resolve_mpp_price walk past level 0 for an order qty bigger
+                                # than the top level alone holds instead of pricing as if it
+                                # were the whole book.
+                                "bid_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in buy_levels if float(lvl.get("price") or 0) > 0
+                                ],
+                                "ask_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in sell_levels if float(lvl.get("price") or 0) > 0
+                                ],
                                 # Previous trading day's close — Dhan's own quote response
                                 # already carries this in ohlc.close, additive field so
                                 # nothing keying off just ['ltp']/['oi'] etc. is affected.
