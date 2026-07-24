@@ -30,6 +30,22 @@ from dotenv import load_dotenv
 load_dotenv(_pathlib.Path(__file__).resolve().parent / ".env")
 
 log = logging.getLogger(__name__)
+
+# Dev bridge: when set, THIS box's place-order route forwards the request as-is to the
+# live server and returns whatever it responds with, instead of placing the order itself
+# — for a local/dev box that can't reach the broker (no whitelisted IP, no live
+# credentials) but still needs a real order_id to develop/test status-tracking, MPP
+# pricing logs, etc. against. Every OTHER route (status polling, order book, the
+# order-updates socket) still runs fully local — only placement is redirected. Off
+# (LIVE_ORDER_PLACEMENT unset/false) behaves exactly as before: places for real, right here.
+#
+# Same env vars/behavior as algo.order/api.py's copy of this bridge — added here too
+# because THIS route (not algo.order's) is the one the Order Pad's "Trade" button
+# actually posts to (POSITIONS_API_BASE, this service's own port) on a dev box where
+# algo.order isn't even running; algo.order's copy of the flag has no effect on traffic
+# that never reaches it.
+LIVE_ORDER_PLACEMENT = os.getenv("LIVE_ORDER_PLACEMENT", "false").strip().lower() == "true"
+LIVE_ORDER_BASE_URL = os.getenv("LIVE_ORDER_BASE_URL", "https://order.finedgealgo.com/order").rstrip("/")
 import time
 import uuid
 from copy import deepcopy
@@ -4151,14 +4167,37 @@ async def _place_manual_order_via_order_service(broker_id: str, orders: list["Ma
 
 
 @sim_router.post("/trade/positions/place-order")
-async def simulator_place_manual_order(body: ManualOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+async def simulator_place_manual_order(body: ManualOrderRequest, request: Request, current_user: dict = Depends(app_auth.get_current_user_for_order_placement)) -> dict:
     """
     Same route + wrapper as algo.trade's (both call the identical
     _simulator_place_manual_order_core defined above) — this service's own
     Order Pad "Trade" button posts to POSITIONS_API_BASE (this port) at this
     exact path, which had no route registered here before, only in algo.trade.
+
+    LIVE_ORDER_PLACEMENT (see its own comment near the top of this file): when set,
+    forwards straight to the live server instead of placing here — placement only, every
+    other route on this box is untouched.
     """
-    result = await _simulator_place_manual_order_core(body)
+    if LIVE_ORDER_PLACEMENT:
+        import requests
+        auth_header = request.headers.get("authorization", "")
+
+        def _forward() -> dict:
+            resp = requests.post(
+                f"{LIVE_ORDER_BASE_URL}/trade/positions/place-order",
+                json=body.model_dump(),
+                headers={"Authorization": auth_header, "Content-Type": "application/json"},
+                timeout=30,
+            )
+            return resp.json()
+
+        try:
+            result = await asyncio.to_thread(_forward)
+        except Exception as exc:
+            log.error("[LIVE_ORDER_PLACEMENT] forward to %s failed: %s", LIVE_ORDER_BASE_URL, exc)
+            return {"status": "error", "message": f"Live order forward failed: {exc}", "results": []}
+    else:
+        result = await _simulator_place_manual_order_core(body)
     try:
         from features.telegram_notifier import notify_user
 
