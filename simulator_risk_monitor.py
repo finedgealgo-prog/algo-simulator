@@ -19,7 +19,9 @@ rather than placing the order in-process here.
 
 Architecture — hot loop vs warm refresh (see plan doc for the full rationale):
   - Hot tick, every HOT_TICK_SECONDS: pure in-memory dict/arithmetic against
-    dhan_ticker_manager.ltp_map (already kept hot by the existing WS ticker).
+    broker_ticker_manager.ltp_map (the broker_gateway proxy — resolves to
+    CentralTickClient in central-tick mode, or dhan_ticker_manager directly
+    otherwise; already kept hot by the existing WS ticker).
     No Mongo, no broker call. O(active legs/baskets), not O(I/O).
   - Warm refresh, every WARM_REFRESH_SECONDS: the only place touching
     Mongo/broker. One _fetch_dhan_broker_option_positions() call per distinct
@@ -690,9 +692,9 @@ class SimulatorRiskMonitor:
     # ── Hot tick: pure in-memory, no I/O ─────────────────────────────────────
 
     def _hot_tick(self, db: MongoData) -> None:
-        from features.dhan_ticker import dhan_ticker_manager
+        from features.broker_gateway import broker_ticker_manager
 
-        ltp_map = dhan_ticker_manager.ltp_map or {}
+        ltp_map = broker_ticker_manager.ltp_map or {}
         in_flight = self.registry.in_flight
         fired_legs: list[dict] = []
         now_str = _now_iso()
@@ -1323,7 +1325,7 @@ class SimulatorRiskMonitor:
         without waiting for the next tick or faking a price move.
         """
         from bson import ObjectId
-        from features.dhan_ticker import dhan_ticker_manager
+        from features.broker_gateway import broker_ticker_manager
 
         raw_db = db._db
         doc = await asyncio.to_thread(raw_db['simulator_strategy'].find_one, {'_id': ObjectId(strategy_id)})
@@ -1332,7 +1334,7 @@ class SimulatorRiskMonitor:
 
         await self._warm_refresh_one_paper_strategy(db, strategy_id, doc)
 
-        ltp_map = dhan_ticker_manager.ltp_map or {}
+        ltp_map = broker_ticker_manager.ltp_map or {}
         now_str = _now_iso()
         paper_trading_mode = self._resolve_paper_trading_mode(strategy_id)
         scenarios: list[dict[str, Any]] = []
@@ -1530,7 +1532,7 @@ class SimulatorRiskMonitor:
         every other fire path here: see the PAPER_AUTO_FIRE_ENABLED comment up top.
         """
         from bson import ObjectId
-        from features.dhan_ticker import dhan_ticker_manager
+        from features.broker_gateway import broker_ticker_manager
 
         raw_db = db._db
         try:
@@ -1558,7 +1560,7 @@ class SimulatorRiskMonitor:
         # those when nothing matches (see its exit_plan loop).
         legs = self.registry.paper_baskets_by_strategy.get(strategy_id) or []
 
-        ltp_map = dict(dhan_ticker_manager.ltp_map or {})
+        ltp_map = dict(broker_ticker_manager.ltp_map or {})
         leg_tokens = [str(leg.get('token') or '').strip() for leg in legs if str(leg.get('token') or '').strip()]
         # A webhook hit (TradingView alert, or a manual curl) can land while no
         # browser/UI session is open — those legs' tokens may never have been
@@ -1933,7 +1935,12 @@ class SimulatorRiskMonitor:
                 order_legs = []
                 for p in positions:
                     tag = str(p.get('tag') or 'EXIT')
-                    side = str(p.get('side') or 'BUY').upper()
+                    # p['side'] is the alert-builder UI's single-letter 'B'/'S' form —
+                    # must go through _normalize_side to the full 'BUY'/'SELL' word before
+                    # comparison, or `side == 'BUY'` below is always False (raw value is
+                    # never the literal string 'BUY'), silently flattening every EXIT leg
+                    # to a BUY order regardless of which side it was actually closing.
+                    side = _normalize_side(p.get('side')) or 'BUY'
                     # EXIT tag: place the opposite side to close; NEW tag: place as-is
                     order_side = ('SELL' if side == 'BUY' else 'BUY') if tag == 'EXIT' else side
                     order_legs.append(ManualOrderLeg(
@@ -2153,8 +2160,8 @@ class SimulatorRiskMonitor:
                         str(basket_legs[0].get('underlying') or '').strip().upper() if basket_legs
                         else str(doc.get('instrument') or '').strip().upper()
                     )
-                    from features.dhan_ticker import dhan_ticker_manager
-                    ws_ltp_map = dhan_ticker_manager.ltp_map or {}
+                    from features.broker_gateway import broker_ticker_manager
+                    ws_ltp_map = broker_ticker_manager.ltp_map or {}
 
                     for ap in adj_positions:
                         tag = str(ap.get('tag') or 'EXIT')
