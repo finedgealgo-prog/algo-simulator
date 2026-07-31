@@ -3849,19 +3849,23 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
     try:
         raw_db = _shared_mongo._db
 
-        # Looked up by _id (the specific account the user picked), not just "any doc with
-        # broker=dhan" — kite_market_config can hold one Dhan doc per user, so matching on
-        # broker alone would silently route every user's order through whichever Dhan doc
-        # Mongo happened to return first instead of the one this broker_id actually names.
+        # Looked up by _id (the specific account the user picked) in broker_configuration —
+        # same collection every other broker (FlatTrade/Kite) uses for order placement.
+        # kite_market_config is feed-only; a Dhan account used for order placement must be
+        # its own broker_configuration doc so routing is scoped to that one account, not a
+        # global "whichever is enabled" doc that every user's orders would silently share.
         dhan_cfg = {}
         if broker_id:
             try:
                 from bson import ObjectId
-                dhan_cfg = raw_db["kite_market_config"].find_one({"_id": ObjectId(broker_id), "broker": "dhan"}) or {}
+                from features.dhan_broker import _is_dhan_doc
+                _candidate = raw_db["broker_configuration"].find_one({"_id": ObjectId(broker_id)})
+                if _candidate and _is_dhan_doc(_candidate):
+                    dhan_cfg = _candidate
             except Exception:
                 dhan_cfg = {}
         if dhan_cfg:
-            dhan_client_id = str(dhan_cfg.get("user_id") or dhan_cfg.get("dhan_client_id") or "").strip()
+            dhan_client_id = str(dhan_cfg.get("broker_user_id") or dhan_cfg.get("user_id") or "").strip()
             dhan_access_token = str(dhan_cfg.get("access_token") or "").strip()
             if not dhan_access_token or not dhan_client_id:
                 print("[PLACE_ORDER][dhan] credentials not configured", flush=True)
@@ -5412,7 +5416,14 @@ async def _simulator_pt_webhook_fire_live_adjustment(webhook_doc: dict) -> dict:
             option_type=_normalize_pt_option_type(str(p.get("option_type") or "")),
             side="SELL" if str(p.get("side") or "").strip().upper() == "S" else "BUY",
             quantity=int(p.get("qty") or p.get("lots") or 1),
-            order_type="LTP",
+            # Default MPP (bid/ask-protected), same as _simulator_pt_webhook_
+            # create_strategy's entry legs — only an explicit LTP/LIMIT/SL
+            # pick on the leg itself downgrades to a plain LTP order. Used to
+            # be hardcoded "LTP" unconditionally, which silently ignored
+            # whatever order type the leg actually carried and always
+            # executed this reverse-exit at the raw LTP instead of protecting
+            # the fill the way MPP does.
+            order_type="LTP" if str(p.get("order_type") or "").strip().upper() in ("LTP", "LIMIT", "SL") else "MPP",
             product="NRML",
         )
         for p in open_positions

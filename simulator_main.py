@@ -128,3 +128,12 @@ async def _auto_start_central_ticker() -> None:
 from chart_api import router as chart_router  # noqa: E402
 
 app.include_router(chart_router)
+
+
+# ── Fast (Parquet-based) paper-trade chain snapshot — mirrors
+# algo.websocket/historical_data_router.py's /simulator/paper-trade/
+# historical-chain* contract (that file is untouched), sourced from
+# shared/parquet_data/ via shared/fast_backtest/chain_snapshot.py.
+from fast_option_chain_api import router as fast_chain_router  # noqa: E402
+
+app.include_router(fast_chain_router)
