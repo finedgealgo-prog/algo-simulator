@@ -1416,6 +1416,196 @@ from features.dhan_token_sync import router as dhan_token_sync_router  # noqa: E
 app.include_router(dhan_token_sync_router)
 
 
+_stock_sync_state: dict = {
+    "running": False,
+    "started_at": "",
+    "finished_at": "",
+    "result": None,
+    "error": "",
+}
+_stock_sync_thread: threading.Thread | None = None
+
+
+_ALL_STOCK_LIST_COLLECTION = "all_stock_list"
+
+
+def _run_stock_sync_from_dhan() -> dict:
+    """
+    Upserts every NSE cash-equity Dhan's scrip master lists into a dedicated
+    all_stock_list collection, keyed by symbol — regardless of index/universe
+    membership (the scanner's own scanner_stocks_list only ever holds stocks
+    belonging to a curated NSE index list like nifty_50/nifty_500/..., and is
+    deliberately left untouched here — see ALL_STOCKS_COLLECTION's comment in
+    shared/features/chart_data.py for why this is a separate collection: this
+    sync's rows are bare placeholders (company_name = symbol, no industry/
+    sector), and shouldn't pollute the scanner's curated list).
+
+    shared/features/chart_data.py's search_symbol_universe /
+    get_symbol_historical_chart_bars read this collection as a fallback for
+    any stock not already in scanner_stocks_list, using dhan_security_id
+    (set here) to resolve candles via Dhan.
+
+    Runs in a background thread (see sync_stocks_from_dhan below) — this
+    parses a ~30MB CSV and bulk-upserts ~2000 docs, too slow to run inline on
+    the request/event loop (same class of bug as /fno-stocks and
+    /v1/symbol_search had before they were fixed the same way).
+    """
+    from features.dhan_token_sync import _get_dhan_scrip_master_rows  # type: ignore
+    from pymongo import UpdateOne
+
+    db = MongoData()._db
+    now = datetime.utcnow()
+
+    # Dhan's CSV has no single fixed literal for "cash equity" (see
+    # _get_dhan_fno_master's own comment: "Dhan CSV may use EQUITY, ES, EQ or
+    # similar for cash equity") — excluding known derivative instrument types
+    # is the robust match instead of guessing the exact literal.
+    _DERIVATIVE_TYPES = {"OPTSTK", "OPTIDX", "FUTSTK", "FUTIDX", "FUTCUR", "OPTCUR", "FUTCOM", "OPTFUT"}
+    rows = _get_dhan_scrip_master_rows()
+
+    equities: dict[str, str] = {}  # symbol -> sec_id, first seen wins
+    for row in rows:
+        if row.get("SEM_EXM_EXCH_ID", "").strip() != "NSE":
+            continue
+        if row.get("SEM_INSTRUMENT_NAME", "").strip() in _DERIVATIVE_TYPES:
+            continue
+        ts = row.get("SEM_TRADING_SYMBOL", "").strip()
+        sec_id = row.get("SEM_SMST_SECURITY_ID", "").strip()
+        symbol = ts.split("-")[0].strip().upper() if ts else ""
+        if not symbol or not sec_id:
+            continue
+        equities.setdefault(symbol, sec_id)
+
+    try:
+        db[_ALL_STOCK_LIST_COLLECTION].create_index("symbol", name="idx_symbol")
+    except Exception:
+        pass
+
+    ops = [
+        UpdateOne(
+            {"symbol": symbol},
+            {
+                "$set": {"dhan_security_id": sec_id, "exchange": "NSE"},
+                "$setOnInsert": {
+                    "symbol": symbol,
+                    "tradingsymbol": symbol,
+                    "company_name": symbol,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        for symbol, sec_id in equities.items()
+    ]
+
+    created = 0
+    updated = 0
+    if ops:
+        result = db[_ALL_STOCK_LIST_COLLECTION].bulk_write(ops, ordered=False)
+        created = result.upserted_count
+        updated = result.modified_count
+
+    return {
+        "status": "success",
+        "source": "Dhan scrip master (NSE cash equity)",
+        "collection": _ALL_STOCK_LIST_COLLECTION,
+        "dhan_equities_found": len(equities),
+        "created": created,
+        "updated": updated,
+        "message": "all_stock_list now covers every NSE stock Dhan lists — scanner_stocks_list untouched",
+    }
+
+
+def _bg_stock_sync() -> None:
+    global _stock_sync_state
+    _stock_sync_state["running"] = True
+    _stock_sync_state["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _stock_sync_state["finished_at"] = ""
+    _stock_sync_state["result"] = None
+    _stock_sync_state["error"] = ""
+    try:
+        _stock_sync_state["result"] = _run_stock_sync_from_dhan()
+    except Exception as exc:
+        _stock_sync_state["error"] = str(exc)
+    finally:
+        _stock_sync_state["running"] = False
+        _stock_sync_state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.get("/algo/sync-stocks-from-dhan")
+async def sync_stocks_from_dhan() -> dict:
+    """Starts the sync in the background and returns immediately — poll
+    /algo/sync-stocks-from-dhan/status for progress/result, same pattern as
+    /algo/sync-tokens/start + /algo/sync-tokens/status."""
+    global _stock_sync_thread
+    if _stock_sync_state["running"]:
+        return {
+            "status": "already_running",
+            "started_at": _stock_sync_state["started_at"],
+            "message": "Sync already in progress. Check /algo/sync-stocks-from-dhan/status",
+        }
+    _stock_sync_thread = threading.Thread(target=_bg_stock_sync, daemon=True)
+    _stock_sync_thread.start()
+    return {
+        "status": "started",
+        "message": "Sync running in background. Check /algo/sync-stocks-from-dhan/status",
+        "status_url": "/algo/sync-stocks-from-dhan/status",
+    }
+
+
+@app.get("/algo/sync-stocks-from-dhan/status")
+async def sync_stocks_from_dhan_status() -> dict:
+    return {
+        "running": _stock_sync_state["running"],
+        "started_at": _stock_sync_state["started_at"],
+        "finished_at": _stock_sync_state["finished_at"],
+        "result": _stock_sync_state["result"],
+        "error": _stock_sync_state["error"],
+    }
+
+
+@app.get("/algo/cleanup-todays-placeholder-stocks")
+async def cleanup_todays_placeholder_stocks(dry_run: bool = True) -> dict:
+    """
+    Removes scanner_stocks_list rows that look like the placeholder inserts
+    an earlier version of /algo/sync-stocks-from-dhan accidentally wrote into
+    that table before it was fixed to write to all_stock_list instead.
+
+    Match is narrower than "everything created today": company_name == symbol
+    (the tell — every genuinely curated row has a real company name, or no
+    company_name field at all if new-but-not-yet-enriched) AND created today.
+    That keeps this from also catching a same-day legitimate scanner sync.
+
+    dry_run=True (default) only previews what would be deleted — call with
+    ?dry_run=false to actually delete.
+    """
+    db = MongoData()._db
+    now = datetime.utcnow()
+    start_of_today = datetime(now.year, now.month, now.day)
+
+    match_filter = {
+        "created_at": {"$gte": start_of_today},
+        "$expr": {"$eq": ["$company_name", "$symbol"]},
+    }
+
+    matches = list(db["scanner_stocks_list"].find(match_filter, {"_id": 0, "symbol": 1}))
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "matched_count": len(matches),
+            "symbols": sorted(m["symbol"] for m in matches),
+            "message": "Preview only — call with ?dry_run=false to actually delete.",
+        }
+
+    result = db["scanner_stocks_list"].delete_many(match_filter)
+    return {
+        "status": "success",
+        "deleted_count": result.deleted_count,
+        "message": "Removed today's placeholder stock rows from scanner_stocks_list.",
+    }
+
+
 class PTPortfolioIn(BaseModel):
     name: str
 
