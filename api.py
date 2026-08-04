@@ -75,6 +75,7 @@ from features.broker_gateway import (
     broker_ticker_manager           as ticker_manager,
 )
 from features.mock_ticker import mock_ticker_manager
+from features.market_hours_scheduler import run_market_hours_scheduler
 from simulator_risk_monitor import simulator_risk_monitor
 from simulator.api_server import router as simulator_router
 from simulator.models import MiniStrangleRequest
@@ -2131,6 +2132,62 @@ async def _auto_expiry_squareoff_catchup():
 # /monitor/{start,stop,status} already uses for the Simulator Monitor. See
 # features/alert_checker.py's start_indicator_alert_monitor/
 # stop_indicator_alert_monitor.
+
+
+async def _scheduled_start_simulator_monitor() -> dict:
+    """Same as GET/POST /simulator/monitor/start, used by the market-hours
+    scheduler — see _simulator_monitors_market_hours_schedule below."""
+    market_ready = _sync_simulator_broker_with_market_session()
+    if not market_ready or getattr(_simulator_broker, "kite", None) is None:
+        log.info("[market_hours_scheduler] skip simulator monitor auto-start — Zerodha session not ready")
+        return {"status": "error", "message": "Simulator market session not ready."}
+    return await simulator_bridge_start(
+        _simulator_broker.kite,
+        _shared_mongo._db["simulator_strategy"],
+        _shared_mongo._db,
+    )
+
+
+async def _scheduled_stop_simulator_monitor() -> dict:
+    _sync_simulator_broker_with_market_session()
+    return await simulator_bridge_stop(
+        getattr(_simulator_broker, "kite", None),
+        _shared_mongo._db["simulator_strategy"],
+        _shared_mongo._db,
+    )
+
+
+async def _scheduled_simulator_monitor_status() -> dict:
+    _sync_simulator_broker_with_market_session()
+    return await simulator_bridge_status(
+        getattr(_simulator_broker, "kite", None),
+        _shared_mongo._db["simulator_strategy"],
+        _shared_mongo._db,
+    )
+
+
+@app.on_event("startup")
+async def _simulator_monitors_market_hours_schedule():
+    """
+    Auto-stop the Simulator Strategy Monitor and Simulator Risk Monitor
+    after market close, auto-start both again ~09:10 next weekday — see
+    features/market_hours_scheduler.py. The existing /simulator/monitor/*
+    and /simulator/risk-monitor/* start/stop endpoints remain available as
+    a manual override at any time — starting/stopping one here never
+    implicitly arms/disarms the other, same as the manual endpoints.
+    """
+    asyncio.create_task(run_market_hours_scheduler(
+        name="simulator-strategy-monitor",
+        start_fn=_scheduled_start_simulator_monitor,
+        stop_fn=_scheduled_stop_simulator_monitor,
+        is_running_fn=_scheduled_simulator_monitor_status,
+    ))
+    asyncio.create_task(run_market_hours_scheduler(
+        name="simulator-risk-monitor",
+        start_fn=simulator_risk_monitor.start,
+        stop_fn=simulator_risk_monitor.stop,
+        is_running_fn=simulator_risk_monitor.get_status,
+    ))
 
 
 @app.on_event("startup")

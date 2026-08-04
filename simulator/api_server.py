@@ -42,7 +42,6 @@ from pydantic import BaseModel
 from features import auth as app_auth
 from features.mongo_data import MongoData
 from simulator_risk_monitor import simulator_risk_monitor
-from .live_option_chain_collector import collector as _live_option_chain_collector
 from .models import MiniStrangleRequest
 from .monitor_service import get_simulator_monitor_service
 from .monitor_ui import build_monitor_toggle_page
@@ -368,48 +367,6 @@ async def monitor_reentry_status() -> dict:
 @router.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
-
-
-@router.post("/live-collector/start")
-@router.get("/live-collector/start")
-async def start_live_option_chain_collector() -> dict:
-    """Starts the WS-tick-driven NIFTY option chain snapshot collector —
-    builds the pre-market contract list, warms the Dhan chain feed, and
-    stores one snapshot per contract per minute into stock_data.option_chain
-    (the same collection OptionChainManager reads for backtests). GET is
-    registered alongside POST so the admin Monitors page's "Start" button
-    (and a plain browser link) can trigger it the same way other rows there
-    do — see algo-admin's src/pages/Admin/Monitors.tsx."""
-    try:
-        return _live_option_chain_collector.start()
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-
-
-@router.post("/live-collector/stop")
-async def stop_live_option_chain_collector() -> dict:
-    try:
-        return _live_option_chain_collector.stop()
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-
-
-@router.get("/live-collector/status")
-async def live_option_chain_collector_status() -> dict:
-    return _live_option_chain_collector.status()
-
-
-@router.get("/live-collector/snapshot-now")
-async def snapshot_live_option_chain_now() -> dict:
-    """Manual one-shot check: inserts whatever real-tick data is available
-    right now for every active_option_tokens contract, immediately — no
-    background thread, no waiting for the next minute boundary the way
-    /live-collector/start's continuous loop does. Hit this, then check
-    stock_data.option_chain straight away."""
-    try:
-        return _live_option_chain_collector.snapshot_now()
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
 
 
 @router.get("/zerodha/status")

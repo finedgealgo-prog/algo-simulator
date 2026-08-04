@@ -114,22 +114,6 @@ async def _auto_start_central_ticker() -> None:
     asyncio.create_task(_bg())
 
 
-# ── Chart domain (TradingView chart-state/alerts/symbol search+history) ──────
-# chart_api.py is symlinked in from ../shared/chart_api.py, same as
-# algo.scanner does — now importable here too because its data layer
-# (features/chart_data.py) no longer depends on the scanner-only `scanner`
-# package. Deliberately NOT calling start_chart_background_loops() here:
-# that starts the price/trendline + indicator alert-checker polling loop,
-# which algo.scanner's process already runs — running it a second time here
-# would double-evaluate every alert and fire each webhook twice. This mount
-# is REST-only (chart-state/alerts CRUD, symbol_search, symbol_historical_chart),
-# so the algo-admin frontend's chart page works whether it's pointed at
-# algo.scanner (8002) or algo.simulator (8001).
-from chart_api import router as chart_router  # noqa: E402
-
-app.include_router(chart_router)
-
-
 # ── Fast (Parquet-based) paper-trade chain snapshot — mirrors
 # algo.websocket/historical_data_router.py's /simulator/paper-trade/
 # historical-chain* contract (that file is untouched), sourced from
