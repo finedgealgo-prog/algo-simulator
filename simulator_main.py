@@ -121,3 +121,18 @@ async def _auto_start_central_ticker() -> None:
 from fast_option_chain_api import router as fast_chain_router  # noqa: E402
 
 app.include_router(fast_chain_router)
+
+
+# ── Chart domain (TradingView chart-state/alerts/symbol_search/
+# symbol_historical_chart, under /v1 — see chart_api.py) ────────────────────
+# REST-only mirror of the same chart_api.py router algo.signals mounts on
+# port 8005 (chart_api.py is symlinked in from ../shared/chart_api.py here
+# too) — the /simulator/full-chart page (Chart.tsx) calls this process
+# directly instead of algo.signals, so the Simulator and Signals frontends
+# never share a backend port. The price/trendline alert-checker background
+# loop (start_chart_background_loops) stays owned solely by algo.signals —
+# this process only serves the REST surface, same split as before the two
+# domains were briefly consolidated onto one port.
+from chart_api import router as chart_router  # noqa: E402
+
+app.include_router(chart_router)
