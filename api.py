@@ -2105,6 +2105,25 @@ async def _auto_start_alert_checker():
 
 
 @app.on_event("startup")
+async def _auto_start_delta_alert_checker():
+    """Continuously evaluate BTC/ETH chart price/trendline/indicator alerts
+    against Delta Exchange's live spot price and fire their webhooks/
+    Telegram notifications — runs for the life of this process, unlike the
+    NSE alert checker (_auto_start_alert_checker above) never auto-stopped
+    for market hours: Delta trades 24/7. See simulator/delta_alert_checker.py
+    — a fully separate module/loop/websocket from the NSE one, not a branch
+    on it (different price source, different bar-fetch, different timing
+    math — see that module's own docstring)."""
+    import asyncio
+    from simulator.delta_alert_checker import (
+        start_delta_alert_checker_loop,
+        start_delta_indicator_alert_scheduler_loop,
+    )
+    asyncio.create_task(start_delta_alert_checker_loop())
+    asyncio.create_task(start_delta_indicator_alert_scheduler_loop())
+
+
+@app.on_event("startup")
 async def _auto_expiry_squareoff_catchup():
     """
     On server restart, exit any paper-strategy positions whose expiry has already
@@ -6470,6 +6489,42 @@ def _sim_user_or_filter(user_id: Any) -> dict:
     return {"user_id": {"$in": ids}}
 
 
+# ── product scoping (NSE "simulator" vs Delta Exchange "crypto") ───────────
+# Both sim_subscription_plans and sim_user_subscriptions predate the `product`
+# field entirely — every doc that existed before this change has none.
+# _seed_sim_subscription_plans_if_empty backfills product="simulator" onto
+# every such doc lazily (once per process, see that function), but every
+# query here ALSO treats a missing product as "simulator" directly, as
+# defense-in-depth in case that backfill hasn't run yet in some environment
+# (e.g. a read that races the lazy migration, or a process that never calls
+# a subscription endpoint at all). A missing product must never be treated
+# as "crypto" — crypto rows are only ever written with the field set
+# explicitly (see simulator_admin_grant_sim_plan / _CRYPTO_DEFAULT_PLANS), so
+# there's nothing legacy to fall back for on that side.
+SIM_PRODUCT_SIMULATOR = "simulator"
+SIM_PRODUCT_CRYPTO = "crypto"
+
+# Which plan slug is "the Free plan" for a given product — used everywhere a
+# resolver falls back to Free because the user has no active subscription
+# row for that product. Distinct slugs (see _CRYPTO_DEFAULT_PLANS) so the two
+# products' Free plans never collide inside _sim_find_plan's slug lookup.
+_SIM_FREE_SLUG_BY_PRODUCT: dict[str, str] = {
+    SIM_PRODUCT_SIMULATOR: "free",
+    SIM_PRODUCT_CRYPTO: "crypto_free",
+}
+
+
+def _sim_product_query_filter(product: str) -> dict:
+    """
+    Mongo filter fragment scoping a sim_user_subscriptions/sim_subscription_plans
+    query to one product. See the module note above for why a missing field
+    counts as "simulator" but never as "crypto".
+    """
+    if product == SIM_PRODUCT_SIMULATOR:
+        return {"$or": [{"product": SIM_PRODUCT_SIMULATOR}, {"product": {"$exists": False}}]}
+    return {"product": product}
+
+
 # ── sim_user_subscriptions.status codes ─────────────────────────────────────
 # Stored as an int (0/1/2/3), not the old "active"/"expired"/"cancelled"
 # strings — every place that reads/writes this field goes through the
@@ -6523,7 +6578,10 @@ def _sim_active_strategy_limit_error(user_id: Any) -> Optional[str]:
     """
     _seed_sim_subscription_plans_if_empty()
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
-    sub_doc = subs_col.find_one(_sim_user_or_filter(user_id), sort=[("_id", -1)]) if user_id is not None else None
+    sub_doc = subs_col.find_one(
+        {**_sim_user_or_filter(user_id), **_sim_product_query_filter(SIM_PRODUCT_SIMULATOR)},
+        sort=[("_id", -1)],
+    ) if user_id is not None else None
     is_active_sub = _sim_sub_effective_status(sub_doc) == SIM_SUB_STATUS_ACTIVE
     plan_id = sub_doc["plan_id"] if (sub_doc and is_active_sub) else "free"
     plan = _sim_find_plan(plan_id) or {}
@@ -6548,7 +6606,10 @@ def _sim_resolve_plan_and_advanced_slots(user_id: Any) -> tuple[dict, int]:
     """
     _seed_sim_subscription_plans_if_empty()
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
-    sub_doc = subs_col.find_one(_sim_user_or_filter(user_id), sort=[("_id", -1)]) if user_id is not None else None
+    sub_doc = subs_col.find_one(
+        {**_sim_user_or_filter(user_id), **_sim_product_query_filter(SIM_PRODUCT_SIMULATOR)},
+        sort=[("_id", -1)],
+    ) if user_id is not None else None
     is_active_sub = _sim_sub_effective_status(sub_doc) == SIM_SUB_STATUS_ACTIVE
     plan_id = sub_doc["plan_id"] if (sub_doc and is_active_sub) else "free"
     plan = _sim_find_plan(plan_id) or {}
@@ -6876,7 +6937,7 @@ async def _run_simulator_session(session_id: str, engine: StrategyEngine) -> Non
 # nothing here re-seeds over an existing collection.
 _SIM_DEFAULT_PLANS: list[dict[str, Any]] = [
     {
-        "slug": "free", "plan_name": "Free", "most_popular": False, "is_active": True,
+        "slug": "free", "plan_name": "Free", "product": "simulator", "most_popular": False, "is_active": True,
         "has_billing_toggle": False, "sort_order": 1,
         "price_oneday": None, "price_monthly": 0, "price_yearly": 0, "original_yearly": None,
         "per_day_monthly": None, "per_day_yearly": None,
@@ -6904,7 +6965,7 @@ _SIM_DEFAULT_PLANS: list[dict[str, Any]] = [
         "upgrade_popup_enabled": True, "credit_purchase_enabled": False, "credit_purchase_amount": None,
     },
     {
-        "slug": "oneday", "plan_name": "1 Day Plan", "most_popular": False, "is_active": True,
+        "slug": "oneday", "plan_name": "1 Day Plan", "product": "simulator", "most_popular": False, "is_active": True,
         "has_billing_toggle": False, "sort_order": 2,
         "price_oneday": 149, "price_monthly": None, "price_yearly": None, "original_yearly": None,
         "per_day_monthly": None, "per_day_yearly": None,
@@ -6932,7 +6993,7 @@ _SIM_DEFAULT_PLANS: list[dict[str, Any]] = [
         "upgrade_popup_enabled": True, "credit_purchase_enabled": False, "credit_purchase_amount": None,
     },
     {
-        "slug": "standard", "plan_name": "Standard", "most_popular": True, "is_active": True,
+        "slug": "standard", "plan_name": "Standard", "product": "simulator", "most_popular": True, "is_active": True,
         "has_billing_toggle": True, "sort_order": 3,
         "price_oneday": None, "price_monthly": 999, "price_yearly": 7999, "original_yearly": 11988,
         "per_day_monthly": 33, "per_day_yearly": 22,
@@ -6960,7 +7021,7 @@ _SIM_DEFAULT_PLANS: list[dict[str, Any]] = [
         "upgrade_popup_enabled": True, "credit_purchase_enabled": True, "credit_purchase_amount": 75,
     },
     {
-        "slug": "pro", "plan_name": "Pro", "most_popular": False, "is_active": False,
+        "slug": "pro", "plan_name": "Pro", "product": "simulator", "most_popular": False, "is_active": False,
         "has_billing_toggle": True, "sort_order": 4,
         "price_oneday": None, "price_monthly": 2499, "price_yearly": 17999, "original_yearly": 29988,
         "per_day_monthly": 83, "per_day_yearly": 49,
@@ -6973,6 +7034,105 @@ _SIM_DEFAULT_PLANS: list[dict[str, Any]] = [
         "card_features": ["20 Advanced Slots", "Priority Queue", "Unlimited Strategies", "Unlimited Logs", "High API Priority"],
         "card_inherit_label": "Standard Plan +",
         "plan_description": "Everything unlocked — unlimited strategies, 20 Advanced slots, unlimited Webhooks and alerts.",
+        "billing_type": "monthly",
+        "sl_target_individual_leg_sl": True, "sl_target_individual_leg_target": True,
+        "sl_target_overall_sl": True, "sl_target_overall_target": True,
+        "webhook_url_limit": -1,
+        "create_strategy_webhook_mode": "enabled", "create_strategy_webhook_limit": -1,
+        "tv_bar_replay": True, "tv_alerts_enabled": True, "tv_price_alerts": True, "tv_price_alerts_count": -1,
+        "tv_trendline_alerts": True, "tv_trendline_alerts_count": -1,
+        "tv_indicator_alerts": True, "tv_max_alerts_per_strategy": -1, "tv_max_indicator_conditions": 10,
+        "manual_position_closing": True, "auto_position_management": True,
+        "position_telegram_notifications": True,
+        "trade_button_mode": "enabled", "trade_generate_webhook_mode": "enabled",
+        "trade_add_alert_mode": "enabled", "trade_payoff_graph_sl_mode": "enabled",
+        "upgrade_popup_enabled": False, "credit_purchase_enabled": False, "credit_purchase_amount": None,
+    },
+]
+
+# Crypto (Delta Exchange BTC/ETH options paper/live trading, see
+# simulator/crypto_paper_trade_router.py) plan tiers — same field shape as
+# _SIM_DEFAULT_PLANS above (every key here must stay in lockstep with that
+# list, since both the AdminPlanIn model and every my-plan response field
+# assume every plan doc — regardless of product — carries the same schema).
+# Distinct slugs ("crypto_free"/"crypto_standard"/"crypto_pro", not the bare
+# "free"/"standard"/"pro" the NSE plans use) purely to avoid any accidental
+# collision — "free" is the one slug that's actually load-bearing (see
+# _sim_find_plan's fallback-to-free resolution), and it must keep resolving
+# to the NSE Free plan for every existing (product-less/"simulator") caller.
+# Seeded once by _seed_sim_subscription_plans_if_empty, same lazy pattern as
+# _SIM_DEFAULT_PLANS — never re-seeded over admin edits after that.
+_CRYPTO_DEFAULT_PLANS: list[dict[str, Any]] = [
+    {
+        "slug": "crypto_free", "plan_name": "Crypto Free", "product": "crypto", "most_popular": False, "is_active": True,
+        "has_billing_toggle": False, "sort_order": 101,
+        "price_oneday": None, "price_monthly": 0, "price_yearly": 0, "original_yearly": None,
+        "per_day_monthly": None, "per_day_yearly": None,
+        "active_strategy_limit": 2, "advanced_slots": 0,
+        "paper_trading": True, "live_trading": False, "live_mtm": True, "stop_loss_target": True,
+        "upper_lower_adjustment": True, "telegram_email_alerts": True, "buy_extra_slots": False,
+        "tradingview_integration": False, "priority_queue": False, "custom_strategies": False,
+        "reentry": True, "premium_support": False, "extra_slot_price": None,
+        "execution_log_days": 7, "api_priority": "none",
+        "card_features": ["Crypto Paper Trading", "2 Default Strategies", "BTC / ETH Options", "Live MTM", "Telegram / Email Alerts"],
+        "card_inherit_label": None,
+        "plan_description": "Get started paper trading BTC/ETH options on Delta Exchange, free forever.",
+        "billing_type": "monthly",
+        "sl_target_individual_leg_sl": True, "sl_target_individual_leg_target": True,
+        "sl_target_overall_sl": False, "sl_target_overall_target": False,
+        "webhook_url_limit": 0,
+        "create_strategy_webhook_mode": "locked", "create_strategy_webhook_limit": 0,
+        "tv_bar_replay": False, "tv_alerts_enabled": False, "tv_price_alerts": False, "tv_price_alerts_count": 0,
+        "tv_trendline_alerts": False, "tv_trendline_alerts_count": 0,
+        "tv_indicator_alerts": False, "tv_max_alerts_per_strategy": 0, "tv_max_indicator_conditions": 0,
+        "manual_position_closing": True, "auto_position_management": False,
+        "position_telegram_notifications": True,
+        "trade_button_mode": "enabled", "trade_generate_webhook_mode": "locked",
+        "trade_add_alert_mode": "locked", "trade_payoff_graph_sl_mode": "locked",
+        "upgrade_popup_enabled": True, "credit_purchase_enabled": False, "credit_purchase_amount": None,
+    },
+    {
+        "slug": "crypto_standard", "plan_name": "Crypto Standard", "product": "crypto", "most_popular": True, "is_active": True,
+        "has_billing_toggle": True, "sort_order": 102,
+        "price_oneday": None, "price_monthly": 1499, "price_yearly": 11999, "original_yearly": 17988,
+        "per_day_monthly": 50, "per_day_yearly": 33,
+        "active_strategy_limit": 50, "advanced_slots": 3,
+        "paper_trading": True, "live_trading": True, "live_mtm": True, "stop_loss_target": True,
+        "upper_lower_adjustment": True, "telegram_email_alerts": True, "buy_extra_slots": True,
+        "tradingview_integration": True, "priority_queue": False, "custom_strategies": True,
+        "reentry": True, "premium_support": False, "extra_slot_price": 75,
+        "execution_log_days": 30, "api_priority": "normal",
+        "card_features": ["3 Advanced Slots", "Live Crypto Trading", "TradingView Integration", "Buy Extra Slots", "30 Day Execution Logs"],
+        "card_inherit_label": "Crypto Free +",
+        "plan_description": "Unlimited regular crypto strategies plus 3 Advanced slots, live Delta Exchange trading, and Webhooks.",
+        "billing_type": "monthly",
+        "sl_target_individual_leg_sl": True, "sl_target_individual_leg_target": True,
+        "sl_target_overall_sl": True, "sl_target_overall_target": True,
+        "webhook_url_limit": 1,
+        "create_strategy_webhook_mode": "enabled", "create_strategy_webhook_limit": 1,
+        "tv_bar_replay": True, "tv_alerts_enabled": True, "tv_price_alerts": True, "tv_price_alerts_count": 2,
+        "tv_trendline_alerts": True, "tv_trendline_alerts_count": 2,
+        "tv_indicator_alerts": True, "tv_max_alerts_per_strategy": 2, "tv_max_indicator_conditions": 2,
+        "manual_position_closing": True, "auto_position_management": True,
+        "position_telegram_notifications": True,
+        "trade_button_mode": "enabled", "trade_generate_webhook_mode": "enabled",
+        "trade_add_alert_mode": "enabled", "trade_payoff_graph_sl_mode": "enabled",
+        "upgrade_popup_enabled": True, "credit_purchase_enabled": True, "credit_purchase_amount": 75,
+    },
+    {
+        "slug": "crypto_pro", "plan_name": "Crypto Pro", "product": "crypto", "most_popular": False, "is_active": True,
+        "has_billing_toggle": True, "sort_order": 103,
+        "price_oneday": None, "price_monthly": 3499, "price_yearly": 26999, "original_yearly": 41988,
+        "per_day_monthly": 117, "per_day_yearly": 74,
+        "active_strategy_limit": -1, "advanced_slots": 20,
+        "paper_trading": True, "live_trading": True, "live_mtm": True, "stop_loss_target": True,
+        "upper_lower_adjustment": True, "telegram_email_alerts": True, "buy_extra_slots": True,
+        "tradingview_integration": True, "priority_queue": True, "custom_strategies": True,
+        "reentry": True, "premium_support": True, "extra_slot_price": 75,
+        "execution_log_days": -1, "api_priority": "high",
+        "card_features": ["20 Advanced Slots", "Priority Queue", "Unlimited Strategies", "Unlimited Logs", "High API Priority"],
+        "card_inherit_label": "Crypto Standard +",
+        "plan_description": "Everything unlocked for crypto — unlimited strategies, 20 Advanced slots, unlimited Webhooks and alerts.",
         "billing_type": "monthly",
         "sl_target_individual_leg_sl": True, "sl_target_individual_leg_target": True,
         "sl_target_overall_sl": True, "sl_target_overall_target": True,
@@ -7057,10 +7217,32 @@ def _seed_sim_subscription_plans_if_empty() -> None:
         return
 
     col = _shared_mongo._db["sim_subscription_plans"]
+    subs_col = _shared_mongo._db["sim_user_subscriptions"]
     if col.count_documents({}) == 0:
-        col.insert_many([dict(p) for p in _SIM_DEFAULT_PLANS])
+        col.insert_many([dict(p) for p in _SIM_DEFAULT_PLANS] + [dict(p) for p in _CRYPTO_DEFAULT_PLANS])
         _sim_subscription_plans_seeded = True
         return
+
+    # ── One-time migration: backfill the `product` field ────────────────────
+    # Every doc in both collections that existed before crypto plans were
+    # added has no `product` field at all — all of it predates the NSE vs
+    # crypto distinction, so it's unambiguously "simulator". Runs every call
+    # until _sim_subscription_plans_seeded flips true (once per process, see
+    # the guard above), same lazy self-heal pattern as the migrations below.
+    # Every read site also treats a missing product as "simulator" directly
+    # (_sim_product_query_filter) as defense-in-depth in case this hasn't run
+    # yet in some environment — this backfill alone is not relied upon.
+    col.update_many({"product": {"$exists": False}}, {"$set": {"product": SIM_PRODUCT_SIMULATOR}})
+    subs_col.update_many({"product": {"$exists": False}}, {"$set": {"product": SIM_PRODUCT_SIMULATOR}})
+
+    # ── One-time seed: crypto plan tiers ────────────────────────────────────
+    # Older environments seeded sim_subscription_plans before crypto plans
+    # existed at all — top up with _CRYPTO_DEFAULT_PLANS the same way the
+    # empty-collection branch above does for a brand-new DB, but only if no
+    # crypto plan has been inserted yet (never re-seeds over an admin's edits
+    # to those plans afterward).
+    if col.count_documents({"product": SIM_PRODUCT_CRYPTO}) == 0:
+        col.insert_many([dict(p) for p in _CRYPTO_DEFAULT_PLANS])
 
     # ── One-time migration: plan_id (string slug) -> real Mongo _id ────────
     # This collection used to store its own hand-picked "plan_id" field
@@ -7079,7 +7261,6 @@ def _seed_sim_subscription_plans_if_empty() -> None:
     # plan _id (looked up by slug, now that the rename above has run), so an
     # already-granted subscription doesn't get silently orphaned by the
     # reference-scheme change.
-    subs_col = _shared_mongo._db["sim_user_subscriptions"]
     for sub_doc in subs_col.find({"plan_id": {"$exists": True, "$ne": None}}):
         stored = sub_doc.get("plan_id")
         if _looks_like_object_id(stored):
@@ -7127,43 +7308,43 @@ def _seed_sim_subscription_plans_if_empty() -> None:
     _sim_subscription_plans_seeded = True
 
 
-@sim_router.get("/simulator/subscription/plans")
-def simulator_subscription_plans() -> list[dict[str, Any]]:
-    # Plain def (not async def) — every call in this body is blocking
-    # pymongo I/O with no await, so as `async def` it was running straight on
-    # the event loop and stalling every other in-flight request (regardless
-    # of route) for its duration. `def` lets FastAPI offload it to its
-    # threadpool instead, same as payment.py's get_subscriptions.
-    """Public — no auth. Plan catalogue only, never user-specific data."""
-    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
-    _t0 = _t.perf_counter()
+def _sim_plans_list_response(product: str = SIM_PRODUCT_SIMULATOR) -> list[dict[str, Any]]:
+    """
+    Shared by GET /simulator/subscription/plans (NSE, product="simulator" by
+    default — every existing caller's URL is unchanged) and the crypto mirror
+    at GET /simulator/crypto-paper-trade/subscription/plans (always passes
+    product="crypto"). Scoped via _sim_product_query_filter so a missing
+    `product` on a legacy doc still counts as "simulator" (see that helper).
+    """
     _seed_sim_subscription_plans_if_empty()
-    print(f"[TIMING subscription/plans] seed check done t={_t.perf_counter()-_t0:.3f}s")
     col = _shared_mongo._db["sim_subscription_plans"]
-    result = [_sim_plan_public(d) for d in col.find({}).sort("sort_order", 1)]
-    print(f"[TIMING subscription/plans] EXIT t={_t.perf_counter()-_t0:.3f}s")
-    return result
+    return [_sim_plan_public(d) for d in col.find(_sim_product_query_filter(product)).sort("sort_order", 1)]
 
 
-@sim_router.get("/simulator/subscription/my-plan")
-def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.require_current_user)) -> dict[str, Any]:
-    # Plain def — see simulator_subscription_plans above for why.
-    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
-    _t0 = _t.perf_counter()
-    print(f"[TIMING subscription/my-plan] ENTER (auth already resolved) t=0.000s")
+def _sim_my_plan_response(user_id: Any, product: str = SIM_PRODUCT_SIMULATOR) -> dict[str, Any]:
+    """
+    Shared by GET /simulator/subscription/my-plan (NSE, product="simulator"
+    by default — every existing caller's URL/response is unchanged) and the
+    crypto mirror at GET /simulator/crypto-paper-trade/subscription/my-plan
+    (always passes product="crypto"). Resolution logic is otherwise identical
+    to before this change — only which sim_user_subscriptions row counts as
+    "the" active one, and which slug Free falls back to, now depend on
+    `product` (_sim_product_query_filter / _SIM_FREE_SLUG_BY_PRODUCT).
+    """
     _seed_sim_subscription_plans_if_empty()
-    print(f"[TIMING subscription/my-plan] seed check done t={_t.perf_counter()-_t0:.3f}s")
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
 
-    user_id = _resolve_sim_user_id(current_user)
-    sub_doc = subs_col.find_one(_sim_user_or_filter(user_id), sort=[("_id", -1)]) if user_id else None
-    print(f"[TIMING subscription/my-plan] find_one sub_doc done t={_t.perf_counter()-_t0:.3f}s")
+    free_slug = _SIM_FREE_SLUG_BY_PRODUCT.get(product, "free")
+    sub_doc = subs_col.find_one(
+        {**_sim_user_or_filter(user_id), **_sim_product_query_filter(product)},
+        sort=[("_id", -1)],
+    ) if user_id else None
 
     sub_status = _sim_sub_effective_status(sub_doc)
     is_active_sub = sub_status == SIM_SUB_STATUS_ACTIVE
 
-    plan_id = sub_doc["plan_id"] if (sub_doc and is_active_sub) else "free"
-    plan = _sim_find_plan(plan_id) or {}
+    plan_id = sub_doc["plan_id"] if (sub_doc and is_active_sub) else free_slug
+    plan = _sim_find_plan(plan_id) or _sim_find_plan(free_slug) or {}
 
     # Once a paid sub_doc expires/cancels, plan_id (and so plan/limits) falls
     # back to Free above — expires_at/starts_at must follow that same fallback,
@@ -7176,16 +7357,16 @@ def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.require
     advanced_slots_purchased = int((sub_doc or {}).get("advanced_slots_purchased") or 0) if is_active_sub else 0
     # "free"/"expired"/"active" here describes which tier is in effect (used
     # by the frontend's isFreePlan checks), not the raw subscription-row
-    # status — a cancelled sub_doc already resolves plan_id back to "free"
-    # above, so it naturally lands in the "free" branch here too. Checked via
-    # plan["slug"] rather than plan_id == "free" directly — a persisted free
-    # sub_doc (see the admin user-sim-plan backfill) has its plan_id
-    # self-healing-migrated from the "free" slug to the plan's real _id by
-    # _seed_sim_subscription_plans_if_empty, so the literal string won't
-    # always match even though the plan itself is still Free.
-    status = "free" if plan.get("slug") == "free" else ("expired" if sub_status == SIM_SUB_STATUS_EXPIRED else "active")
+    # status — a cancelled sub_doc already resolves plan_id back to the
+    # product's free slug above, so it naturally lands in the "free" branch
+    # here too. Checked via plan["slug"] rather than plan_id == free_slug
+    # directly — a persisted free sub_doc (see the admin user-sim-plan
+    # backfill) has its plan_id self-healing-migrated from the slug to the
+    # plan's real _id by _seed_sim_subscription_plans_if_empty, so the
+    # literal string won't always match even though the plan itself is still
+    # Free.
+    status = "free" if plan.get("slug") == free_slug else ("expired" if sub_status == SIM_SUB_STATUS_EXPIRED else "active")
 
-    print(f"[TIMING subscription/my-plan] EXIT t={_t.perf_counter()-_t0:.3f}s")
     return {
         "plan_id": str(plan.get("_id", "")),
         "plan_name": plan["plan_name"],
@@ -7246,22 +7427,71 @@ def simulator_subscription_my_plan(current_user: dict = Depends(app_auth.require
     }
 
 
+@sim_router.get("/simulator/subscription/plans")
+def simulator_subscription_plans(product: str = SIM_PRODUCT_SIMULATOR) -> list[dict[str, Any]]:
+    # Plain def (not async def) — every call in this body is blocking
+    # pymongo I/O with no await, so as `async def` it was running straight on
+    # the event loop and stalling every other in-flight request (regardless
+    # of route) for its duration. `def` lets FastAPI offload it to its
+    # threadpool instead, same as payment.py's get_subscriptions.
+    """
+    Public — no auth. Plan catalogue only, never user-specific data.
+    ?product=simulator|crypto — defaults to "simulator" so every existing
+    caller (frontend included) keeps getting exactly the NSE plan list it
+    always did. The crypto comparison page instead calls the mirror endpoint
+    GET /simulator/crypto-paper-trade/subscription/plans, which always passes
+    product="crypto" (see crypto_paper_trade_router.py).
+    """
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    result = _sim_plans_list_response(product)
+    print(f"[TIMING subscription/plans] EXIT t={_t.perf_counter()-_t0:.3f}s")
+    return result
+
+
+@sim_router.get("/simulator/subscription/my-plan")
+def simulator_subscription_my_plan(
+    product: str = SIM_PRODUCT_SIMULATOR,
+    current_user: dict = Depends(app_auth.require_current_user),
+) -> dict[str, Any]:
+    # Plain def — see simulator_subscription_plans above for why.
+    """
+    ?product=simulator|crypto — defaults to "simulator" so every existing
+    caller keeps resolving the NSE plan it always did. The crypto mirror
+    endpoint GET /simulator/crypto-paper-trade/subscription/my-plan always
+    passes product="crypto" (see crypto_paper_trade_router.py).
+    """
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    print(f"[TIMING subscription/my-plan] ENTER (auth already resolved) t=0.000s")
+    user_id = _resolve_sim_user_id(current_user)
+    result = _sim_my_plan_response(user_id, product)
+    print(f"[TIMING subscription/my-plan] EXIT t={_t.perf_counter()-_t0:.3f}s")
+    return result
+
+
 @sim_router.get("/simulator/admin/user-sim-plan/{user_id}")
-async def simulator_admin_get_user_sim_plan(user_id: str) -> dict:
+async def simulator_admin_get_user_sim_plan(user_id: str, product: str = SIM_PRODUCT_SIMULATOR) -> dict:
     """Admin: get the current sim plan for a given user_id. A user with no
     subscription history at all has never had a row in sim_user_subscriptions
     — the Free tier was purely synthesized on the fly and so had nothing for
     the admin Subscriptions table to show. Backfill one real "free" row here
-    (plan_id stays the literal "free" slug, same sentinel every other
-    resolver — my-plan, resolve_user_plan, etc. — already falls back to when
-    there's no sub_doc, so this changes nothing about how those resolve;
-    it just makes the Free tier a persisted, admin-visible record too)."""
+    (plan_id stays the literal free-slug sentinel for `product`, same one
+    every other resolver — my-plan, resolve_user_plan, etc. — already falls
+    back to when there's no sub_doc, so this changes nothing about how those
+    resolve; it just makes the Free tier a persisted, admin-visible record
+    too). ?product defaults to "simulator" so the existing admin Subscriptions
+    table (NSE) is unaffected; pass product=crypto for the crypto tab."""
     _seed_sim_subscription_plans_if_empty()
     subs_col  = _shared_mongo._db["sim_user_subscriptions"]
+    free_slug = _SIM_FREE_SLUG_BY_PRODUCT.get(product, "free")
 
-    sub_doc = subs_col.find_one(_sim_user_or_filter(user_id), sort=[("_id", -1)])
+    sub_doc = subs_col.find_one(
+        {**_sim_user_or_filter(user_id), **_sim_product_query_filter(product)},
+        sort=[("_id", -1)],
+    )
     if not sub_doc:
-        free_plan = _sim_find_plan("free")
+        free_plan = _sim_find_plan(free_slug)
         free_name = free_plan.get("plan_name", "Free") if free_plan else "Free"
         now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
         try:
@@ -7270,8 +7500,9 @@ async def simulator_admin_get_user_sim_plan(user_id: str) -> dict:
             user_ref = user_id
         subs_col.insert_one({
             "user_id":      user_ref,
-            "plan_id":      "free",
+            "plan_id":      free_slug,
             "plan_name":    free_name,
+            "product":      product,
             "status":       SIM_SUB_STATUS_ACTIVE,
             "starts_at":    now_str,
             "expires_at":   None,
@@ -7280,20 +7511,21 @@ async def simulator_admin_get_user_sim_plan(user_id: str) -> dict:
             "advanced_slots_purchased": 0,
             "updated_at":   now_str,
         })
-        return {"plan_id": "free", "plan_name": free_name, "status": "free", "expires_at": None, "reference_by": "system_free"}
+        return {"plan_id": free_slug, "plan_name": free_name, "product": product, "status": "free", "expires_at": None, "reference_by": "system_free"}
 
     expires_at = sub_doc.get("expires_at")
     status     = SIM_SUB_STATUS_LABELS[_sim_sub_effective_status(sub_doc)]
-    plan_id    = sub_doc.get("plan_id", "free")
+    plan_id    = sub_doc.get("plan_id", free_slug)
     plan_doc   = _sim_find_plan(plan_id) or {}
-    # Checked via plan_doc["slug"] rather than plan_id == "free" — see the
+    # Checked via plan_doc["slug"] rather than plan_id == free_slug — see the
     # matching note in simulator_subscription_my_plan above.
-    if plan_doc.get("slug") == "free" and status == "active":
+    if plan_doc.get("slug") == free_slug and status == "active":
         status = "free"
 
     return {
         "plan_id":      plan_id,
         "plan_name":    plan_doc.get("plan_name") or sub_doc.get("plan_name") or plan_id,
+        "product":      sub_doc.get("product") or SIM_PRODUCT_SIMULATOR,
         "status":       status,
         "expires_at":   expires_at,
         "starts_at":    sub_doc.get("starts_at"),
@@ -7303,15 +7535,18 @@ async def simulator_admin_get_user_sim_plan(user_id: str) -> dict:
 
 
 @sim_router.delete("/simulator/admin/user-sim-plan/{user_id}")
-async def simulator_admin_cancel_user_sim_plan(user_id: str) -> dict:
+async def simulator_admin_cancel_user_sim_plan(user_id: str, product: str = SIM_PRODUCT_SIMULATOR) -> dict:
     """Admin: cancel the given user's current active sim plan. Targets only
-    the currently-active row (by _id) — sim_user_subscriptions is an
-    append-only history now, so a blind update-by-user_id could otherwise
-    hit an arbitrary past (already-cancelled/expired) row instead of the
-    live one."""
+    the currently-active row (by _id) for `product` — sim_user_subscriptions
+    is an append-only history now, so a blind update-by-user_id could
+    otherwise hit an arbitrary past (already-cancelled/expired) row, or (now
+    that crypto rows share this collection) the wrong product's row entirely,
+    instead of the live one for the product actually being cancelled.
+    ?product defaults to "simulator" so the existing admin Subscriptions
+    table (NSE) is unaffected; pass product=crypto for the crypto tab."""
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
     current = subs_col.find_one(
-        {**_sim_user_or_filter(user_id), "status": SIM_SUB_STATUS_ACTIVE},
+        {**_sim_user_or_filter(user_id), "status": SIM_SUB_STATUS_ACTIVE, **_sim_product_query_filter(product)},
         sort=[("_id", -1)],
     )
     if not current:
@@ -7328,12 +7563,20 @@ async def simulator_admin_cancel_user_sim_plan(user_id: str) -> dict:
 async def simulator_admin_grant_sim_plan(payload: dict) -> dict:
     """
     Admin-only: instantly activate a sim plan for any user without payment.
-    Body: { user_id, plan_id, plan_name, validity_days, billing }
+    Body: { user_id, plan_id, plan_name, validity_days, billing, product }
+
+    `product` ("simulator" | "crypto") is optional, defaulting to "simulator"
+    — kept optional rather than required so any existing caller (e.g. an
+    already-deployed admin UI build that doesn't yet send it) keeps granting
+    NSE plans exactly as before, rather than 422ing. New/updated callers
+    should always pass it explicitly once the admin UI gets a product
+    selector (separate frontend change).
     """
     user_id_raw   = str(payload.get("user_id") or "").strip()
     plan_id_input = str(payload.get("plan_id") or "").strip()
     validity_days = int(payload.get("validity_days") or 30)
     billing       = str(payload.get("billing") or "monthly")
+    product       = str(payload.get("product") or SIM_PRODUCT_SIMULATOR).strip()
 
     if not user_id_raw or not plan_id_input:
         from fastapi import HTTPException
@@ -7350,6 +7593,10 @@ async def simulator_admin_grant_sim_plan(payload: dict) -> dict:
         raise HTTPException(status_code=404, detail=f"Plan '{plan_id_input}' not found in sim_subscription_plans")
     plan_id   = str(plan_doc["_id"])
     plan_name = str(payload.get("plan_name") or plan_doc.get("plan_name") or plan_id)
+    # Trust the plan doc's own product over whatever the caller passed, if
+    # they disagree — a grant should never end up scoped to a different
+    # product than the plan it's actually granting.
+    product = plan_doc.get("product") or product
 
     now = datetime.now(IST)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
@@ -7364,18 +7611,21 @@ async def simulator_admin_grant_sim_plan(payload: dict) -> dict:
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
     # Always insert a fresh row — sim_user_subscriptions is an append-only
     # history of every grant/cancel, not one row per user that gets
-    # overwritten in place. Any row still marked active for this user is
-    # superseded (cancelled) first, mirroring the same
+    # overwritten in place. Any row still marked active for this user FOR
+    # THIS SAME PRODUCT is superseded (cancelled) first, mirroring the same
     # cancel-then-insert pattern payment.py's admin_grant_subscription/
-    # verify_payment already use for the generic subscriptions collection.
+    # verify_payment already use for the generic subscriptions collection —
+    # scoped by product so granting a crypto plan can never cancel a user's
+    # separate, still-active NSE plan (or vice versa).
     subs_col.update_many(
-        {**_sim_user_or_filter(user_id_raw), "status": SIM_SUB_STATUS_ACTIVE},
+        {**_sim_user_or_filter(user_id_raw), "status": SIM_SUB_STATUS_ACTIVE, **_sim_product_query_filter(product)},
         {"$set": {"status": SIM_SUB_STATUS_CANCELLED, "updated_at": now_str}},
     )
     subs_col.insert_one({
         "user_id":     user_oid if user_oid else user_id_raw,
         "plan_id":     plan_id,
         "plan_name":   plan_name,
+        "product":     product,
         "status":      SIM_SUB_STATUS_ACTIVE,
         "starts_at":   now_str,
         "expires_at":  expires_at,
@@ -7391,6 +7641,7 @@ async def simulator_admin_grant_sim_plan(payload: dict) -> dict:
         "user_id": user_id_raw,
         "plan_id": plan_id,
         "plan_name": plan_name,
+        "product": product,
         "validity_days": validity_days,
         "expires_at": expires_at,
     }
@@ -7407,6 +7658,11 @@ class AdminPlanIn(BaseModel):
     # purely internal/cosmetic tag (only "free" is actually load-bearing —
     # see _sim_find_plan's fallback-to-free-plan resolution).
     slug: Optional[str] = None
+    # "simulator" (NSE) or "crypto" (Delta Exchange). Defaults to "simulator"
+    # so the existing admin Subscription Plans screen — which doesn't yet
+    # send this field — keeps creating/editing NSE plans exactly as before;
+    # a product selector there is a separate, later frontend change.
+    product: str = SIM_PRODUCT_SIMULATOR
     plan_name: str
     plan_description: str = ""
     billing_type: str = "monthly"  # monthly | yearly | lifetime | oneday
@@ -7561,7 +7817,7 @@ async def simulator_admin_list_plans() -> list[dict[str, Any]]:
 
 
 @sim_router.get("/simulator/admin/subscriptions")
-async def simulator_admin_list_subscriptions(plan_id: Optional[str] = None) -> list[dict[str, Any]]:
+async def simulator_admin_list_subscriptions(plan_id: Optional[str] = None, product: Optional[str] = None) -> list[dict[str, Any]]:
     """
     Admin: every sim_user_subscriptions row, joined with the subscriber's
     name/email (from user_details) and the plan's current name (from
@@ -7569,10 +7825,16 @@ async def simulator_admin_list_subscriptions(plan_id: Optional[str] = None) -> l
     view, since sim_user_subscriptions.plan_id is only a matching string, not
     a real foreign key into sim_subscription_plans. Optional ?plan_id= filters
     to one plan's subscribers (used by the "N active users" badge on the
-    Subscription Plans list).
+    Subscription Plans list). Optional ?product=simulator|crypto filters to
+    one product's rows; omitted (the default) returns both NSE and crypto
+    rows together, each tagged with its own `product` field below, so the
+    admin table can show/tell them apart at a glance without a filter.
     """
+    _seed_sim_subscription_plans_if_empty()
     subs_col = _shared_mongo._db["sim_user_subscriptions"]
     query: dict[str, Any] = {"plan_id": plan_id} if plan_id else {}
+    if product:
+        query.update(_sim_product_query_filter(product))
     docs = list(subs_col.find(query).sort("expires_at", -1))
 
     users_col = _shared_mongo._db[app_auth.USERS_COLLECTION]
@@ -7594,6 +7856,10 @@ async def simulator_admin_list_subscriptions(plan_id: Optional[str] = None) -> l
             "user_mobile": (user_doc or {}).get("mobile"),
             "plan_id": doc.get("plan_id"),
             "plan_name": plan_names.get(doc.get("plan_id")) or doc.get("plan_name"),
+            # Missing on pre-migration docs the lazy backfill hasn't reached
+            # yet — same missing-field-means-simulator fallback as every
+            # other product-aware read (_sim_product_query_filter).
+            "product": doc.get("product") or SIM_PRODUCT_SIMULATOR,
             "status": SIM_SUB_STATUS_LABELS[_sim_sub_effective_status(doc)],
             "billing": doc.get("billing"),
             "starts_at": doc.get("starts_at"),
@@ -7677,6 +7943,31 @@ app.include_router(live_quote_socket_router)
 # at http://localhost:8001/simulator/auth/subscriptions here.
 from features.payment import payment_router  # noqa: E402
 app.include_router(payment_router, prefix="/simulator")
+# Delta Exchange (crypto BTC/ETH option chain) — fully standalone module
+# (simulator/delta_exchange_client.py + delta_exchange_ws.py), no shared code
+# with the NSE broker_gateway/live_option_chain path above.
+from simulator.delta_exchange_router import delta_exchange_router  # noqa: E402
+app.include_router(delta_exchange_router)
+# Browser-facing live-tick push for crypto option/perpetual symbols — same
+# delta_ticker_manager in-process cache the REST endpoints above read, just
+# exposed over a WebSocket instead of polled per-request. Mirrors shared/
+# features/live_quote_socket.py's protocol (replace/subscribe/unsubscribe +
+# ltp_update pushes) so useLiveQuoteSocket.ts can be pointed at it unchanged.
+from simulator.delta_live_quote_socket import delta_live_quote_socket_router  # noqa: E402
+app.include_router(delta_live_quote_socket_router)
+# Browser-facing live-tick push for the crypto OPTION CHAIN (bid/ask/OI/greeks per
+# strike) — separate from delta_live_quote_socket_router above, which only pushes
+# per-token LTP. Same {action, instrument, expiry} multiplexed protocol NSE's
+# /ws/live-greeks-chain speaks (live_greeks_chain_socket.py, algo.websocket) so
+# CryptoTradeNew.tsx's useLiveChainSocketMulti — shared, protocol-agnostic code —
+# just needs pointing at this origin instead.
+from simulator.delta_live_chain_socket import delta_live_chain_socket_router  # noqa: E402
+app.include_router(delta_live_chain_socket_router)
+# Push channel for BTC/ETH chart alerts firing server-side (see
+# delta_alert_checker.py below) — deliberately its own websocket/channel,
+# not the NSE chart's /ws/alert-events (shared/features/alert_events_socket.py).
+from simulator.delta_alert_events_socket import delta_alert_events_socket_router  # noqa: E402
+app.include_router(delta_alert_events_socket_router)
 
 
 # ─── Kite Broker Endpoints ────────────────────────────────────────────────────

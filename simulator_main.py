@@ -136,3 +136,14 @@ app.include_router(fast_chain_router)
 from chart_api import router as chart_router  # noqa: E402
 
 app.include_router(chart_router)
+
+
+# ── Crypto paper-trade persistence (Delta Exchange BTC/ETH options) ─────────
+# Isolated strategy/portfolio save/list/update/delete endpoints for
+# CryptoTradeNew.tsx, reading/writing crypto_simulator_strategy /
+# crypto_simulator_portfolio instead of the NSE simulator_strategy /
+# simulator_portfolio collections api.py's own /simulator/paper-trade/*
+# routes use — see simulator/crypto_paper_trade_router.py for why.
+from simulator.crypto_paper_trade_router import router as crypto_paper_trade_router  # noqa: E402
+
+app.include_router(crypto_paper_trade_router)
