@@ -27,6 +27,7 @@ GET /simulator/crypto/rest-option-chain/{instrument}[?expiry=DD-MM-YYYY]
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -329,6 +330,22 @@ async def get_delta_positions_broker_status() -> dict:
     }
 
 
+# Delta's daily BTC/ETH options settle at 12:00 UTC (5:30pm IST) — same convention already
+# confirmed against live product data on the frontend (CryptoTradeNew.tsx's
+# formatTimeToExpiry). A leg whose expiry has already passed that moment (open OR closed —
+# Delta itself has settled/removed it from the live product list by then) must not reach the
+# live Positions page at all once the next expiry has rolled in, rather than relying on the
+# frontend to hide it.
+def _is_expiry_settled(expiry_iso: str) -> bool:
+    if not expiry_iso:
+        return False  # perpetual futures/legs with no expiry are never "settled"
+    try:
+        settlement = datetime.strptime(expiry_iso[:10], "%Y-%m-%d").replace(hour=12, tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) >= settlement
+
+
 def _flatten_delta_strategies(strategies: list[dict], db=None) -> list[dict]:
     """Reshapes the grouped {instrument, positions:[...]}[] payload (what
     CryptoLivePositions.tsx's StrategyCard components read) into the flat, one-leg-
@@ -349,6 +366,8 @@ def _flatten_delta_strategies(strategies: list[dict], db=None) -> list[dict]:
         # and only consumer that needs the multiplication done here instead.
         contract_value = DELTA_CONTRACT_VALUE.get(underlying, 1.0)
         for leg in strategy.get("positions") or []:
+            if _is_expiry_settled(leg.get("expiry") or ""):
+                continue
             raw_entry = leg.get("entry_price") or 0
             # CRYPTO BUGFIX: this used to fall back to `raw_entry` whenever Delta's own
             # mark_price came back 0/missing (fetch_delta_open_positions already turns that
@@ -528,6 +547,17 @@ async def get_delta_positions_all() -> dict:
     finally:
         db.close()
     strategies = payload.get("strategies") or []
+    # Drop legs whose expiry has already settled (see _is_expiry_settled) before either
+    # `strategies` (CryptoLivePositions.tsx's StrategyCard grouping) or the flattened
+    # `positions` list (CryptoTradeNew.tsx) below sees them — once the next expiry has
+    # rolled in at 5:30pm IST, neither an open nor a same-day-closed leg from the now-
+    # settled expiry belongs on the live Positions page anymore. A strategy left with zero
+    # legs after filtering is dropped entirely rather than rendering an empty card.
+    strategies = [
+        {**strategy, "positions": [leg for leg in (strategy.get("positions") or []) if not _is_expiry_settled(leg.get("expiry") or "")]}
+        for strategy in strategies
+    ]
+    strategies = [strategy for strategy in strategies if strategy.get("positions")]
     return {
         "status": "success" if payload.get("ok") else "error",
         "broker_id": "deltaExchange",

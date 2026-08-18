@@ -70,6 +70,8 @@ from api import (  # noqa: E402
     PTWebhookIn,
     PTNewStrategyWebhookIn,
     PTUpdateStrategyWebhookIn,
+    PTTriggerIn,
+    PTAlertConfigIn,
     ManualOrderLeg,
     _resolve_sim_user_id,
     _enrich_pt_strategy_positions,
@@ -128,6 +130,17 @@ CRYPTO_ADJUSTMENTS_COLLECTION = "crypto_simulator_adjustments"
 # section near the bottom of this file for the endpoints that read/write this and the
 # force_fire_adjustment caveat (SimulatorRiskMonitor is NSE-only, see that section).
 CRYPTO_WEBHOOKS_COLLECTION = "crypto_simulator_webhooks"
+# Per-leg SL/Target ("Add Alert") and basket-level Position Configuration
+# (Stoploss/Target/Trail SL/Hedge) storage — isolated the same way
+# crypto_simulator_adjustments is isolated from simulator_adjustments.
+# Same caveat as CRYPTO_ADJUSTMENTS_COLLECTION above: SimulatorRiskMonitor
+# only scans the NSE simulator_triggers/simulator_portfolio_triggers
+# collections, so these are plain CRUD/record-keeping for now — nothing
+# auto-fires off a saved crypto trigger yet. Indexes for both already exist
+# (see MongoData.ensure_core_indexes, uniq_crypto_trigger_by_broker_leg /
+# uniq_crypto_portfolio_trigger_by_broker_underlying).
+CRYPTO_TRIGGERS_COLLECTION = "crypto_simulator_triggers"
+CRYPTO_PORTFOLIO_TRIGGERS_COLLECTION = "crypto_simulator_portfolio_triggers"
 
 # Same default portfolio buckets api.py seeds for NSE (_DEFAULT_PAPER_TRADE_PORTFOLIOS),
 # duplicated here (not imported) since it's a two-item literal, not worth
@@ -821,6 +834,86 @@ async def crypto_pt_delete_adjustment(
         query.update({"strategy_id": strategy_id} if strategy_id else {"broker_id": broker_id, "underlying": underlying})
         result = _shared_mongo._db[CRYPTO_ADJUSTMENTS_COLLECTION].delete_many(query)
         return {"status": "success", "deleted": result.deleted_count}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+# ── Triggers / Alert config (Position Configuration panel) ──────────────────
+@router.post("/triggers")
+async def crypto_pt_save_trigger(body: PTTriggerIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """Mirrors api.py's simulator_pt_save_trigger (api.py:4696-4727), crypto_ collection."""
+    try:
+        col = _shared_mongo._db[CRYPTO_TRIGGERS_COLLECTION]
+        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        col.update_one(
+            {"broker_id": body.broker_id, "leg_id": body.leg_id},
+            {
+                "$set": {
+                    "underlying": body.underlying, "expiry": body.expiry, "strike": body.strike,
+                    "option_type": body.option_type, "side": body.side,
+                    "sl_mode": body.sl_mode, "sl_value": body.sl_value,
+                    "tp_mode": body.tp_mode, "tp_value": body.tp_value,
+                    "entry_price_at_set": body.entry_price, "quantity_at_set": body.quantity,
+                    "exited_at_set": body.exited,
+                    "status": "active", "updated_at": now_str,
+                },
+                "$setOnInsert": {"created_at": now_str},
+            },
+            upsert=True,
+        )
+        return {"status": "success"}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@router.get("/alert-config")
+async def crypto_pt_get_alert_config(broker_id: str = Query(...), underlying: str = Query(...), current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """Mirrors api.py's simulator_pt_get_alert_config (api.py:4765-4788), crypto_ collection."""
+    try:
+        doc = _shared_mongo._db[CRYPTO_PORTFOLIO_TRIGGERS_COLLECTION].find_one(
+            {"broker_id": broker_id, "underlying": underlying},
+        ) or {}
+        return {
+            "status": "success",
+            "trading_mode": doc.get("alert_trading_mode") or "auto",
+            "stoploss": doc.get("alert_stoploss") or {},
+            "target": doc.get("alert_target") or {},
+            "trailing_stop": doc.get("alert_trailing_stop") or {},
+            "hedge_strike_type": doc.get("alert_hedge_strike_type") or {},
+            "hedge_time_control": doc.get("alert_hedge_time_control") or {},
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@router.post("/alert-config")
+async def crypto_pt_save_alert_config(body: PTAlertConfigIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """Mirrors api.py's simulator_pt_save_alert_config (api.py:4791+), crypto_ collection."""
+    try:
+        col = _shared_mongo._db[CRYPTO_PORTFOLIO_TRIGGERS_COLLECTION]
+        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        snapshot = sorted(
+            ({"leg_id": s.leg_id, "quantity": s.quantity, "entry_price": s.entry_price, "side": s.side} for s in body.legs_snapshot),
+            key=lambda s: s["leg_id"],
+        )
+        col.update_one(
+            {"broker_id": body.broker_id, "underlying": body.underlying},
+            {
+                "$set": {
+                    "alert_trading_mode": body.trading_mode,
+                    "alert_stoploss": body.stoploss.model_dump(),
+                    "alert_target": body.target.model_dump(),
+                    "alert_trailing_stop": body.trailing_stop.model_dump(),
+                    "alert_hedge_strike_type": body.hedge_strike_type.model_dump(),
+                    "alert_hedge_time_control": body.hedge_time_control.model_dump(),
+                    "legs_snapshot": snapshot,
+                    "status": "active", "updated_at": now_str,
+                },
+                "$setOnInsert": {"created_at": now_str},
+            },
+            upsert=True,
+        )
+        return {"status": "success"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 

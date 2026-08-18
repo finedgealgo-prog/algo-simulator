@@ -147,3 +147,14 @@ app.include_router(chart_router)
 from simulator.crypto_paper_trade_router import router as crypto_paper_trade_router  # noqa: E402
 
 app.include_router(crypto_paper_trade_router)
+
+
+# ── Crypto historical chain replay (Mongo-backed, manual backtest) ──────────
+# Mongo-backed twin of fast_chain_router above, for CryptoPaperTradeBacktestNew.tsx
+# — reads crypto_option_chain_historical_data (populated by
+# crypto_option_chain_backfill.py --write) instead of shared/parquet_data/,
+# since crypto backfills land in Mongo, not Parquet. See
+# simulator/crypto_chain_snapshot.py.
+from simulator.crypto_fast_option_chain_api import router as crypto_fast_chain_router  # noqa: E402
+
+app.include_router(crypto_fast_chain_router)
