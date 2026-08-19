@@ -27,7 +27,7 @@ GET /simulator/crypto/rest-option-chain/{instrument}[?expiry=DD-MM-YYYY]
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -112,6 +112,49 @@ def _iso_to_ddmmyyyy(value: str) -> str:
     return f"{dd}-{mm}-{yyyy}"
 
 
+# underlying -> (utc_day it was resolved for, previous close). Delta's /rest-
+# option-chain/{instrument} is polled on every chain refresh (sub-second cadence
+# once a picker/chart is open), but a closed daily candle never changes once its
+# UTC day is over — no reason to hit Delta's candle API more than once per
+# underlying per day. Mirrors execution_socket.py's _STABLE_PREV_CLOSE for NSE.
+_CRYPTO_PREV_CLOSE_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def _resolve_crypto_previous_close(underlying: str) -> float:
+    """Previous UTC calendar day's close for a crypto underlying.
+
+    Crypto trades 24/7 — there's no NSE-style 15:30 closing-auction print to
+    anchor "previous close" on, so this can't reuse _previous_session_close's
+    approach of scanning our own recorded ticks for one. Delta's own public
+    daily candle (fetch_candles, /v2/history/candles on the spot-index symbol)
+    IS the authoritative close for a UTC day, and needs no auth — used the same
+    on-demand way _dhan_daily_close uses Dhan's historical-candle API as the
+    ground truth for NSE's previous close, rather than depending on any of our
+    own collections having a tick recorded at exactly the right moment.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cached = _CRYPTO_PREV_CLOSE_CACHE.get(underlying)
+    if cached is not None and cached[0] == today and cached[1] > 0:
+        return cached[1]
+    try:
+        now = datetime.now(timezone.utc)
+        bars = fetch_candles(underlying, "1D", int((now - timedelta(days=4)).timestamp()), int(now.timestamp()))
+    except Exception as exc:
+        log.warning("[delta_exchange_router] previous-close candle fetch failed for %s: %s", underlying, exc)
+        return cached[1] if cached else 0.0
+    # bars are ascending by time and can include today's still-forming candle —
+    # walk back from the end and take the first bar dated strictly before today.
+    prev_close = 0.0
+    for bar in reversed(bars):
+        bar_day = datetime.fromtimestamp(bar["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        if bar_day < today:
+            prev_close = float(bar["close"])
+            break
+    if prev_close > 0:
+        _CRYPTO_PREV_CLOSE_CACHE[underlying] = (today, prev_close)
+    return prev_close
+
+
 def _to_strategy_payload(underlying: str, snapshot: dict, expiries: list[str]) -> dict:
     """Reshapes our internal chain dict (see delta_exchange_client.build_chain_from_tickers)
     into the exact StrategyPayload shape CryptoTradeNew.tsx/useLiveChainSocket expect —
@@ -119,12 +162,25 @@ def _to_strategy_payload(underlying: str, snapshot: dict, expiries: list[str]) -
     internal shape doesn't carry (india_vix, lot_size). Delta options are already quoted
     per-contract (no lot multiplier), so lot_size is fixed at 1; india_vix has no crypto
     equivalent — 0 rather than fabricating a number. expiry/expiries go out as ISO — see
-    _ddmmyyyy_to_iso."""
+    _ddmmyyyy_to_iso.
+
+    previous_close/change_pct/change_points added here (previously missing entirely from
+    this payload) — CryptoTradeNew.tsx's mainSpotChange/overlaySpotChange read change_pct
+    straight off this chain (mainChain?.change_pct / overlayChain?.change_pct), which was
+    always undefined without this, so the instrument bar's %change always showed 0.00%
+    (or silently mismatched a stale/unrelated value from a different chain source)."""
+    spot_price = snapshot["spot_price"]
+    previous_close = _resolve_crypto_previous_close(underlying)
+    change_pct = round((spot_price - previous_close) / previous_close * 100, 2) if previous_close > 0 else 0.0
+    change_points = round(spot_price - previous_close, 2) if previous_close > 0 else 0.0
     return {
         "instrument": underlying,
         "expiry": _ddmmyyyy_to_iso(snapshot["expiry"]),
         "expiries": [_ddmmyyyy_to_iso(e) for e in expiries],
-        "spot_price": snapshot["spot_price"],
+        "spot_price": spot_price,
+        "previous_close": round(previous_close, 2),
+        "change_pct": change_pct,
+        "change_points": change_points,
         "atm_strike": snapshot["atm_strike"],
         "strike_interval": snapshot["strike_interval"],
         "india_vix": 0.0,
