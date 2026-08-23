@@ -114,6 +114,39 @@ async def _auto_start_central_ticker() -> None:
     asyncio.create_task(_bg())
 
 
+# ── Delta Exchange ticker startup ─────────────────────────────────────────────
+#
+# delta_exchange_ws.py's own connection was deliberately lazy-started (first
+# request calls ensure_subscribed()) so adding crypto didn't require any
+# startup wiring — see that module's docstring. That's fine in isolation, but
+# it means the FIRST live user to open the crypto page after any process
+# restart hits a cold connection (no cached ticks yet, brief gap before
+# _STALE_AFTER_SECONDS-style fallbacks even apply), and — same root concern as
+# the NSE central ticker above — this feed should always be the site's own
+# server-side connection, warm and ready, not something that only exists once
+# a request happens to trigger it. Pre-subscribing the two supported
+# underlyings (delta_exchange_router.SUPPORTED_UNDERLYINGS) here at boot, in a
+# background thread so it can't delay this process's own startup/health check,
+# makes the connection auto-start exactly like every other feed in this app —
+# additive only: ensure_subscribed() is itself idempotent/cheap to call again
+# per-request, so this doesn't change any existing request-time behavior.
+def _start_delta_ticker() -> None:
+    from simulator.delta_exchange_router import SUPPORTED_UNDERLYINGS
+    from features.delta_exchange_ws import delta_ticker_manager
+
+    for underlying in SUPPORTED_UNDERLYINGS:
+        try:
+            delta_ticker_manager.ensure_subscribed(underlying)
+        except Exception:
+            log.exception("[simulator_main] Delta ticker pre-subscribe failed underlying=%s", underlying)
+    log.info("[simulator_main] Delta Exchange ticker auto-started for %s", SUPPORTED_UNDERLYINGS)
+
+
+@app.on_event("startup")
+async def _auto_start_delta_ticker() -> None:
+    threading.Thread(target=_start_delta_ticker, daemon=True, name="delta_ticker_autostart").start()
+
+
 # ── Fast (Parquet-based) paper-trade chain snapshot — mirrors
 # algo.websocket/historical_data_router.py's /simulator/paper-trade/
 # historical-chain* contract (that file is untouched), sourced from

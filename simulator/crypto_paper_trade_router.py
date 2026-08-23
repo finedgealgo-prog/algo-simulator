@@ -72,7 +72,6 @@ from api import (  # noqa: E402
     PTUpdateStrategyWebhookIn,
     PTTriggerIn,
     PTAlertConfigIn,
-    ManualOrderLeg,
     _resolve_sim_user_id,
     _enrich_pt_strategy_positions,
     _sim_user_or_filter,
@@ -83,7 +82,6 @@ from api import (  # noqa: E402
     _disable_tv_alerts_for_webhook,
     _normalize_pt_option_type,
     _net_pt_positions,
-    _place_manual_order_via_order_service,
     _SIM_DEFAULT_USER_ID,
     # Product-scoping helpers (added alongside the crypto `product` field on
     # sim_subscription_plans/sim_user_subscriptions) — see api.py's own
@@ -363,6 +361,23 @@ def _insert_crypto_simulator_strategy(
     return str(result.inserted_id)
 
 
+def _crypto_group_expiry_to_iso(expiry_date: str) -> str:
+    """algo_trade_positions_history's expiry_date is 'DD-MM-YYYY HH:MM:SS'
+    (execution_socket.py's own save format) — crypto_pt_get_strategy's positions
+    use plain ISO 'YYYY-MM-DD' (see CryptoTradeNew.tsx's fetchTradeStrategy:
+    `String(p.expiry || "").slice(0, 10)`), so convert here rather than pushing
+    two different expiry formats onto one frontend Leg-mapping function."""
+    raw = expiry_date.strip()
+    if not raw:
+        return ""
+    for fmt in ("%d-%m-%Y %H:%M:%S", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(raw[:19], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
 def _find_owned_crypto_strategy(strategy_id: str, current_user: dict) -> Optional[dict]:
     """Mirrors api.py's _find_owned_strategy (api.py:5861), crypto_ collection."""
     doc = _shared_mongo._db[CRYPTO_STRATEGY_COLLECTION].find_one({"_id": ObjectId(strategy_id)})
@@ -492,6 +507,126 @@ async def crypto_pt_get_strategy(strategy_id: str, current_user: dict = Depends(
         if not doc:
             return {"status": "error", "message": "Not found"}
         return {"status": "success", "strategy": _str_id(_enrich_pt_strategy_positions(doc))}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@router.get("/executed-group/{group_id}")
+async def crypto_pt_get_executed_group(group_id: str, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """Crypto-specific replacement for CryptoTradeAnalyse.tsx's old path into the
+    algo.trade-side, NSE-shared /strategy-trade-history/group/{group_id} endpoint
+    (api.py:algo.trade's _aggregate_group_trade_history_payload) — that endpoint
+    reshapes algo_trades/algo_trade_positions_history legs into a generic
+    "legs.open/closed" shape built for NSE, which needed a growing pile of
+    frontend-side reinterpretation (loadContractValue multiplies, isExternalEntityView
+    exceptions) to make crypto's raw-points convention line up with it, and was still
+    unreliable (its status/activation_mode guess didn't account for "fast-forward"
+    mode at all, silently returning zero legs for a fast-forward group).
+
+    This instead reads algo_trades (filtered by strategy_group_id, no activation_mode
+    guess needed — a group_id is unique regardless of mode) + algo_trade_positions_history
+    directly — same collections/fields compute_strategy_mtm already reads correctly for
+    the Overall SL/Target trigger — and returns legs in the EXACT field shape
+    crypto_pt_get_strategy's own `positions` array uses (type/expiry/strike/option_type/
+    entry_price/exit_price/current_ltp/exited/token/entry_time/exit_time/lots/lot_size/
+    quantity). The frontend's fetchTradeStrategy leg-mapper — proven correct for
+    /trade/:id — is reused completely unchanged against this response; only the fetch
+    URL and the "no update/save for a live executed group" affordances differ.
+
+    lot_size is always returned as 1 with lots/quantity set to the real traded quantity
+    (never DB's own `lot_size` field) — that field is confirmed spurious NSE-carryover
+    on a crypto leg (see strategyLegPnl.ts's legQty() comment), never the real Delta
+    contract count; forcing 1 here means resolveBrokerSizing's existing
+    lots = quantity/lot_size math naturally recovers the right size with zero
+    crypto-specific branching needed on the frontend.
+    """
+    try:
+        from features.trading_core import safe_float, is_sell, parse_timestamp, COL_POSITIONS_HIST
+        from features.delta_event import normalize_crypto_underlying
+
+        current_user_id = _resolve_sim_user_id(current_user)
+        trades_col = _shared_mongo._db["algo_trades"]
+        query: dict[str, Any] = {"strategy_group_id": group_id}
+        if current_user_id:
+            query["user_id"] = current_user_id
+        trades = list(trades_col.find(query))
+        if not trades:
+            return {"status": "error", "message": "Not found"}
+        trade_ids = [str(t["_id"]) for t in trades]
+
+        hist_col = _shared_mongo._db[COL_POSITIONS_HIST]
+        # entry_trade/exit_trade.traded_timestamp are IST civil time (execution_socket.py
+        # writes them via datetime.now(IST), same convention this file's own IST constant
+        # exists for) — naive, no tzinfo. Comparing that against a naive UTC "now" silently
+        # misjudged a leg as still-open for up to 5.5 hours after it had actually already
+        # exited (verified against a real leg: exit_trade present with a real fill price,
+        # but exit_dt in the future relative to UTC "now" made exited come back False).
+        # parse_timestamp strips tzinfo (see its docstring), so match its naive domain by
+        # dropping IST's own offset here too, rather than leaving it UTC.
+        now_dt = datetime.now(IST).replace(tzinfo=None)
+        positions: list[dict] = []
+        for doc in hist_col.find({"trade_id": {"$in": trade_ids}}):
+            entry_trade = doc.get("entry_trade") if isinstance(doc.get("entry_trade"), dict) else {}
+            if not entry_trade:
+                continue  # pending leg — not yet entered, nothing to show
+            entry_price = safe_float(entry_trade.get("price") or entry_trade.get("trigger_price"))
+            if entry_price <= 0:
+                continue
+            exit_trade = doc.get("exit_trade") if isinstance(doc.get("exit_trade"), dict) else None
+            exit_ts = str((exit_trade or {}).get("traded_timestamp") or (exit_trade or {}).get("trigger_timestamp") or "").strip()
+            exit_dt = parse_timestamp(exit_ts)
+            exited = bool(exit_trade) and (not exit_dt or not now_dt or exit_dt <= now_dt)
+            quantity = safe_float(doc.get("quantity") or entry_trade.get("quantity"))
+            if quantity <= 0:
+                continue
+            positions.append({
+                "type": "sell" if is_sell(str(doc.get("position") or "")) else "buy",
+                "expiry": _crypto_group_expiry_to_iso(str(doc.get("expiry_date") or "")),
+                "strike": safe_float(doc.get("strike")),
+                "option_type": "put" if str(doc.get("option") or "").strip().upper() == "PE" else "call",
+                "entry_price": entry_price,
+                "exit_price": (safe_float(exit_trade.get("price") or exit_trade.get("trigger_price")) if exit_trade else None),
+                # Always null, matching crypto_pt_get_strategy's own crypto_simulator_strategy
+                # source exactly — CryptoTradeAnalyse.tsx's fetchTradeStrategy leg-mapper has a
+                # `Number(p.current_ltp) > 0 ? ... : existing?.ltp` branch that ONLY takes the
+                # `existing?.ltp` path (preserving the live WS-ticked price across every 30s
+                # poll) when current_ltp is falsy — see that mapper's own comment. That branch
+                # is unreachable for a crypto_simulator_strategy leg since the backend never
+                # populates current_ltp for Delta symbols there. Populating it here from
+                # last_saw_price (a periodically-persisted DB snapshot, staler than the live WS
+                # tick stream by design) took the OTHER branch instead — silently snapping this
+                # endpoint's legs' ltp backward to that stale value every 30s poll, a visible
+                # "wrong number" a live WS-ticked NSE-sourced leg never has. Leaving this null
+                # lets the exact same fallback protect the live tick here too.
+                "current_ltp": None,
+                "exited": exited,
+                "token": (str(doc.get("token") or doc.get("symbol") or "") or None),
+                "entry_time": (str(entry_trade.get("traded_timestamp") or "") or None),
+                "exit_time": (str((exit_trade or {}).get("traded_timestamp") or "") if exited and exit_trade else None),
+                "lot_size": 1,
+                "lots": quantity,
+                "quantity": quantity,
+                "leg_id": str(doc.get("_id") or ""),
+            })
+
+        tickers = {normalize_crypto_underlying(str(t.get("ticker") or "")) for t in trades}
+        tickers.discard("")
+        instrument = next(iter(tickers), "")
+        group_names = sorted({str(t.get("name") or "").strip() for t in trades if t.get("name")})
+        strategy_name = (
+            f"{group_names[0]} ({len(trades)})" if len(trades) > 1 and group_names
+            else (group_names[0] if group_names else f"Group {group_id}")
+        )
+        return {
+            "status": "success",
+            "strategy": {
+                "_id": group_id,
+                "strategy_name": strategy_name,
+                "instrument": instrument,
+                "positions": positions,
+                "execution_mode": "regular",
+            },
+        }
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -1210,11 +1345,16 @@ async def _crypto_webhook_create_strategy(webhook_doc: dict) -> dict:
     silently no-op (harmless, but pointless — and not "mirroring", it'd be dead code
     imported from api.py for no benefit). So: the paper branch below saves each leg's
     entry_price/entry_time exactly as captured when the webhook URL was generated,
-    same as every other "no live requote" webhook doc field. The live branch's
-    _place_manual_order_via_order_service call IS reused as-is below — it's a generic
-    broker_id/ManualOrderLeg proxy to algo.order's /internal/place-order gateway with
-    no NSE-specific logic of its own; the fill price it returns overwrites the
-    snapshot the same way it does for NSE.
+    same as every other "no live requote" webhook doc field.
+
+    The live branch below calls _place_crypto_manual_order_via_order_service (the
+    crypto-specific gateway), NOT api.py's NSE _place_manual_order_via_order_service —
+    this used to reuse that NSE proxy on the theory that it was generic, but it only
+    recognizes Dhan/FlatTrade/Kite broker_configuration docs and rejects everything
+    else, so every live crypto webhook strategy created through this branch was
+    silently failing to place its real order at that exact last step. See
+    _place_crypto_manual_order_via_order_service's own docstring, and this function's
+    order-construction comment below for why order_type is always MARKET here.
     """
     positions = webhook_doc.get("positions") or []
     trade_status = str(webhook_doc.get("trade_status") or "paper")
@@ -1239,23 +1379,43 @@ async def _crypto_webhook_create_strategy(webhook_doc: dict) -> dict:
         if not broker_id:
             return {"status": "error", "message": "Webhook has no broker configured."}
         open_positions = [p for p in positions if not p.get("exited")]
+        # Plain dicts shaped like CryptoOrderLeg (algo.order/crypto_order_router.py), NOT
+        # ManualOrderLeg — the NSE Pydantic model this used to build. _place_manual_order_
+        # via_order_service (the NSE gateway) only recognizes Dhan/FlatTrade/Kite
+        # broker_configuration docs and rejects everything else, so every live crypto
+        # webhook strategy created via this branch was silently failing to place its real
+        # order at this exact step — see _place_crypto_manual_order_via_order_service's
+        # own docstring for why the crypto-specific gateway had to be built, and
+        # _crypto_webhook_fire_live_adjustment below (already correct) for the pattern
+        # this now mirrors.
+        #
+        # order_type="MARKET" unconditionally, not the mpp/ltp choice the webhook payload
+        # carries — same reasoning _crypto_webhook_fire_live_adjustment's own order-
+        # construction comment gives: DeltaExchangeAdapter's _ORDER_TYPE_TO_DELTA only
+        # recognizes LIMIT/MARKET/SL/SL-M, so an unrecognized "MPP"/"LTP" value silently
+        # fell back to a LIMIT order at price=0.0 (there's no live requote step here to
+        # safely price a LIMIT order, unlike NSE's MPP/LTP resolution) — the exact
+        # badly-priced-live-order failure mode that comment warns about. MARKET is the
+        # safe, real-fill choice until a genuine Delta depth/LTP requote path exists.
         orders = [
-            ManualOrderLeg(
-                underlying=instrument,
-                expiry=str(p.get("expiry") or ""),
-                strike=float(p.get("strike") or 0),
-                option_type=_normalize_pt_option_type(str(p.get("option_type") or p.get("type") or "")),
-                side="SELL" if str(p.get("type") or "").strip().lower().startswith("s") else "BUY",
-                quantity=int((p.get("lots") or 1) * (p.get("lot_size") or 1)),
-                order_type="MPP" if p.get("order_type") == "mpp" else "LTP",
-                product="NRML",
-            )
+            {
+                "underlying": instrument,
+                "expiry": str(p.get("expiry") or ""),
+                "strike": float(p.get("strike") or 0),
+                "option_type": _normalize_pt_option_type(str(p.get("option_type") or p.get("type") or "")),
+                "side": "SELL" if str(p.get("type") or "").strip().lower().startswith("s") else "BUY",
+                "quantity": int((p.get("lots") or 1) * (p.get("lot_size") or 1)),
+                "order_type": "MARKET",
+                "price": 0.0,
+                "trigger_price": 0.0,
+                "leg_id": str(p.get("leg_id") or p.get("token") or ""),
+            }
             for p in open_positions
         ]
         if not orders:
             return {"status": "error", "message": "No open legs to trade."}
 
-        order_result = await _place_manual_order_via_order_service(broker_id, orders)
+        order_result = await _place_crypto_manual_order_via_order_service(broker_id, orders)
         if order_result.get("status") not in ("success", "partial"):
             return {"status": "error", "message": order_result.get("message") or "Order placement failed.", "results": order_result.get("results")}
         extra_fields["broker_id"] = broker_id

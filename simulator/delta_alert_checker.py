@@ -47,8 +47,8 @@ from features.mongo_data import MongoData
 from features.telegram_notifier import notify_user_for
 
 from simulator.delta_alert_events_socket import mark_delta_alert_fired
-from simulator.delta_exchange_client import fetch_candles
-from simulator.delta_exchange_ws import delta_ticker_manager
+from features.delta_exchange_client import fetch_candles
+from features.delta_exchange_ws import delta_ticker_manager
 
 logger = logging.getLogger(__name__)
 

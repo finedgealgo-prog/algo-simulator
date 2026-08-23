@@ -171,7 +171,7 @@ def _build_minute_bars(csv_path: str, underlying: str, chunksize: int) -> dict[t
 # ── pass 2: fetch spot history from Delta, paginated ────────────────────────
 
 def _fetch_spot_series(underlying: str, start_dt: datetime, end_dt: datetime) -> dict[str, float]:
-    from simulator.delta_exchange_client import fetch_candles
+    from features.delta_exchange_client import fetch_candles
 
     spot_symbol = _DELTA_SPOT_SYMBOL.get(underlying)
     if not spot_symbol:

@@ -34,7 +34,7 @@ from pydantic import BaseModel
 
 from features import auth as app_auth
 from features.order_brokers.brokers.delta_exchange import _is_delta_doc
-from simulator.delta_exchange_client import (
+from features.delta_exchange_client import (
     DELTA_CONTRACT_VALUE,
     fetch_candles,
     fetch_delta_open_positions,
@@ -47,7 +47,7 @@ from simulator.delta_exchange_client import (
     set_usd_inr_rate,
     verify_delta_credentials,
 )
-from simulator.delta_exchange_ws import delta_ticker_manager
+from features.delta_exchange_ws import delta_ticker_manager
 
 log = logging.getLogger(__name__)
 

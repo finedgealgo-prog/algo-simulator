@@ -33,9 +33,11 @@ Symbol shapes handled (see _parse_delta_symbol):
     -> parsed into (underlying, expiry); ensure_subscribed() is called so
     delta_ticker_manager actually starts/keeps receiving ticks for that
     underlying+expiry's whole chain (cheap/idempotent — see its docstring).
-    ltp is scaled by DELTA_CONTRACT_VALUE the same way delta_exchange_client.
-    _leg_row does for the REST chain endpoints, since the frontend's P&L math
-    expects that convention, not Delta's raw per-1-unit quote.
+    ltp is raw points (Delta's own quoted mark_price, unscaled) — same
+    convention entry_trade.price and every other live-price read in this
+    codebase now uses (see delta_event._get_delta_ltp's comment); a frontend
+    consumer that needs a real $/₹ P&L applies DELTA_CONTRACT_VALUE (and,
+    for ₹, the fixed USD→INR rate) itself — see utils/deltaPnl.ts.
   - Perpetual future: "{underlying}USD", e.g. "BTCUSD" — ensure_subscribed()
     already adds the bare perpetual symbol as a side effect of subscribing
     to any expiry for that underlying (see delta_exchange_ws.ensure_subscribed),
@@ -59,8 +61,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from simulator.delta_exchange_client import DELTA_CONTRACT_VALUE
-from simulator.delta_exchange_ws import delta_ticker_manager
+from features.delta_exchange_ws import delta_ticker_manager
 
 log = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -120,11 +121,10 @@ def _parse_delta_symbol(symbol: str) -> dict | None:
 
 
 def _resolve_ltp(token: str, meta: dict) -> float:
-    """Reads delta_ticker_manager's live cache for one symbol and applies the
-    same USD scaling _leg_row (delta_exchange_client.py) applies for the REST
-    chain endpoints, so this socket's numbers agree with the REST-fetched
-    chain the frontend already renders. Returns 0.0 if no tick has landed yet
-    (just-subscribed, or Delta hasn't pushed one for this symbol)."""
+    """Reads delta_ticker_manager's live cache for one symbol — raw points for
+    an option (Delta's own quoted mark_price, unscaled; see module docstring),
+    real USD already for a perpetual/spot. Returns 0.0 if no tick has landed
+    yet (just-subscribed, or Delta hasn't pushed one for this symbol)."""
     if meta["kind"] == "spot":
         # Reads the perpetual's own ticker payload (it carries both
         # mark_price and spot_price) rather than "token" (the "-SPOT"
@@ -140,10 +140,7 @@ def _resolve_ltp(token: str, meta: dict) -> float:
     mark_price = float(ticker.get("mark_price") or 0)
     if mark_price <= 0:
         return 0.0
-    if meta["kind"] == "option":
-        contract_value = DELTA_CONTRACT_VALUE.get(meta["underlying"], 1.0)
-        return mark_price * contract_value
-    return mark_price  # perpetual — already real USD, no scaling (see module docstring)
+    return mark_price  # option: raw points. perpetual: already real USD (see module docstring).
 
 
 @dataclass

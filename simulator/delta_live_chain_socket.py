@@ -36,9 +36,9 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from simulator.delta_exchange_client import fetch_option_chain_rest
+from features.delta_exchange_client import fetch_option_chain_rest
 from simulator.delta_exchange_router import _iso_to_ddmmyyyy, _to_strategy_payload
-from simulator.delta_exchange_ws import delta_ticker_manager
+from features.delta_exchange_ws import delta_ticker_manager
 
 log = logging.getLogger(__name__)
 
