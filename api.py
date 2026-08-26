@@ -2188,24 +2188,20 @@ async def _scheduled_simulator_monitor_status() -> dict:
 @app.on_event("startup")
 async def _simulator_monitors_market_hours_schedule():
     """
-    Auto-stop the Simulator Strategy Monitor and Simulator Risk Monitor
-    after market close, auto-start both again ~09:10 next weekday — see
-    features/market_hours_scheduler.py. The existing /simulator/monitor/*
-    and /simulator/risk-monitor/* start/stop endpoints remain available as
-    a manual override at any time — starting/stopping one here never
-    implicitly arms/disarms the other, same as the manual endpoints.
+    Auto-stop the Simulator Strategy Monitor after market close, auto-start
+    it again ~09:10 next weekday — see features/market_hours_scheduler.py.
+    /simulator/monitor/* remains available as a manual override at any time.
+
+    Simulator Risk Monitor is no longer registered here — it defaults to
+    OFF on boot (server capacity call, 2026-08-26); /simulator/risk-monitor/
+    {start,stop} (and the Admin Monitors page) remain the only way to start
+    it, for whichever days/sessions it's actually needed.
     """
     asyncio.create_task(run_market_hours_scheduler(
         name="simulator-strategy-monitor",
         start_fn=_scheduled_start_simulator_monitor,
         stop_fn=_scheduled_stop_simulator_monitor,
         is_running_fn=_scheduled_simulator_monitor_status,
-    ))
-    asyncio.create_task(run_market_hours_scheduler(
-        name="simulator-risk-monitor",
-        start_fn=simulator_risk_monitor.start,
-        stop_fn=simulator_risk_monitor.stop,
-        is_running_fn=simulator_risk_monitor.get_status,
     ))
 
 
