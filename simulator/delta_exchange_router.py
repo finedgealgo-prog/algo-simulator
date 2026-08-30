@@ -775,6 +775,65 @@ async def delta_indicator_alert_monitor_status(current_user: dict = Depends(app_
     return {"status": "success", "running": is_delta_indicator_alert_monitor_running()}
 
 
+# ── BTC/ETH live option chain collector ─────────────────────────────────────
+# Nearest-expiry BTC/ETH chain snapshot, once a minute, into stock_data.
+# option_chain — see crypto_live_option_chain_collector.py. Already
+# auto-started unconditionally at process boot (api.py's
+# _auto_start_crypto_live_collector, Delta trades 24/7 so no market-hours
+# schedule); these exist as a manual override, same parity the NSE Live
+# Option Chain Collector row gives on algo.scanner's /live-collector/*.
+@delta_exchange_router.api_route("/live-collector/start", methods=["GET", "POST"])
+async def crypto_live_collector_start(current_user: dict = Depends(app_auth.require_current_user)) -> dict:
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+    try:
+        return crypto_collector.start()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@delta_exchange_router.api_route("/live-collector/stop", methods=["GET", "POST"])
+async def crypto_live_collector_stop(current_user: dict = Depends(app_auth.require_current_user)) -> dict:
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+    try:
+        return crypto_collector.stop()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@delta_exchange_router.get("/live-collector/status")
+async def crypto_live_collector_status(current_user: dict = Depends(app_auth.require_current_user)) -> dict:
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+    return crypto_collector.status()
+
+
+@delta_exchange_router.get("/live-collector/snapshot-now")
+async def crypto_live_collector_snapshot_now(current_user: dict = Depends(app_auth.require_current_user)) -> dict:
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+    try:
+        return crypto_collector.snapshot_now()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@delta_exchange_router.api_route("/live-collector/convert-now", methods=["GET", "POST"])
+async def crypto_live_collector_convert_now(current_user: dict = Depends(app_auth.require_current_user)) -> dict:
+    """Admin 'Convert Now' button (Monitors page) — converts TODAY's rows
+    (whatever is already in stock_data.option_chain right now, doesn't wait
+    for the daily auto-export) to Parquet for BTC/ETH, separately, under
+    shared/parquet_data/optimized/. Convert-only: never deletes anything
+    from Mongo (delete_after=False), unlike the daily auto export+clear
+    path (api.py's _auto_crypto_chain_parquet_export_scheduler), which
+    clears the previous day only. Exists so today's output can be checked
+    by hand — file counts, row counts, a spot-check of the actual Parquet —
+    same as the NSE Live Option Chain Collector row's own Convert Now."""
+    from simulator.crypto_live_chain_parquet_export import export_today
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+
+    underlyings = crypto_collector.status().get("underlyings") or []
+    results = [export_today(u, delete_after=False) for u in underlyings]
+    return {"results": results, "ok_count": sum(1 for r in results if r["ok"]), "total": len(results)}
+
+
 # ── Delta Exchange upstream WS connection ───────────────────────────────────
 # The actual socket everything crypto-side depends on (chart live ticks,
 # delta_alert_checker.py's price polling, the option chain) — all read

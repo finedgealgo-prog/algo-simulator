@@ -2124,6 +2124,51 @@ async def _auto_start_delta_alert_checker():
 
 
 @app.on_event("startup")
+async def _auto_start_crypto_live_collector():
+    """Auto-starts the BTC/ETH per-minute option chain snapshot collector on
+    server boot — Delta trades 24/7 so, unlike the NSE live-collector
+    (market-hours auto start/stop on algo.scanner), this just runs
+    continuously. Manual override via the Admin Monitors page still works
+    (Start/Stop) — see simulator/crypto_live_option_chain_collector.py."""
+    from simulator.crypto_live_option_chain_collector import crypto_collector
+    try:
+        crypto_collector.start()
+    except Exception:
+        log.exception("[CRYPTO LIVE COLLECTOR] auto-start failed")
+
+
+@app.on_event("startup")
+async def _auto_crypto_chain_parquet_export_scheduler():
+    """Daily archive+clear for the crypto live collector's Mongo rows —
+    crypto has no NSE-style market close to hang this off, so instead this
+    fires once shortly after this process comes up, then again every 24h
+    from that point on — NOT pinned to a fixed wall-clock time (an earlier
+    version waited for the next 00:10 UTC, which meant a process that
+    reload/restarts after 00:10 has already passed for the day sits doing
+    nothing until the following day; startup-relative timing means it's
+    never more than a couple minutes from actually running, on any restart).
+    Each run archives the PREVIOUS UTC day's BTC/ETH rows to Parquet and
+    clears them from stock_data.option_chain (see crypto_live_chain_
+    parquet_export.py's module docstring for why yesterday, never today —
+    today's rows are still being written to, clearing them mid-day would be
+    wrong). Keeps that collection from growing unbounded the way it would
+    if every minute's BTC/ETH snapshot just accumulated forever."""
+    import asyncio
+
+    async def _run():
+        from simulator.crypto_live_chain_parquet_export import export_and_clear_yesterday
+        await asyncio.sleep(120)  # let Mongo/collector startup settle first
+        while True:
+            try:
+                await asyncio.to_thread(export_and_clear_yesterday)
+            except Exception:
+                log.exception("[CRYPTO LIVE CHAIN EXPORT] scheduled export+clear failed")
+            await asyncio.sleep(24 * 3600)
+
+    asyncio.create_task(_run())
+
+
+@app.on_event("startup")
 async def _auto_expiry_squareoff_catchup():
     """
     On server restart, exit any paper-strategy positions whose expiry has already
