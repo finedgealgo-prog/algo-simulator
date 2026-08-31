@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
 
 from openpyxl import Workbook
@@ -140,7 +140,7 @@ class StreamingController:
         # Stores the engine's authoritative backtest_summary for the Profit Summary sheet
         self._backtest_summary: Optional[dict] = None
 
-        session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         os.makedirs(_REPORTS_DIR, exist_ok=True)
         self._csv_path: str = os.path.join(_REPORTS_DIR, f"backtest_{session_tag}.xlsx")
 
@@ -159,7 +159,7 @@ class StreamingController:
 
         CSV recording: all events except monitor are stored; flushed to disk on "stopped".
         """
-        wall_ts = datetime.now().isoformat(timespec="milliseconds")
+        wall_ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         payload = json.dumps({"event": event_type, "ts": wall_ts, "data": data})
         await self._queue.put(payload)
 
@@ -505,7 +505,7 @@ class StreamingController:
                 if self._stopped and self._queue.empty():
                     break
                 # Keep-alive comment (ignored by SSE parsers)
-                yield f": heartbeat {datetime.now().isoformat(timespec='seconds')}\n\n"
+                yield f": heartbeat {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n\n"
             except Exception as exc:
                 logger.error(f"[stream] unexpected error: {exc}")
                 break

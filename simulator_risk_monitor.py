@@ -85,7 +85,7 @@ PAPER_AUTO_FIRE_ENABLED = True
 
 
 def _now_iso() -> str:
-    return datetime.now(IST).strftime('%Y-%m-%dT%H:%M:%S')
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

@@ -41,6 +41,7 @@ from pydantic import BaseModel
 
 from features import auth as app_auth
 from features.mongo_data import MongoData
+from features.nse_market_hours import nse_trade_date
 from simulator_risk_monitor import simulator_risk_monitor
 from .models import MiniStrangleRequest
 from .monitor_service import get_simulator_monitor_service
@@ -137,7 +138,7 @@ def _ensure_default_simulator_portfolios() -> None:
         if not _simulator_portfolio_col.find_one({"name": portfolio_name}, {"_id": 1}):
             _simulator_portfolio_col.insert_one({
                 "name": portfolio_name,
-                "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
 
 
@@ -409,7 +410,7 @@ async def get_option_chain(timestamp: str = Query(...)) -> dict:
 
 @router.get("/lot-size")
 async def get_lot_size(instrument: str = "nifty") -> dict:
-    today = datetime.now(IST).strftime("%Y-%m-%d")
+    today = nse_trade_date()
     symbol = str(instrument or "nifty").upper()
     doc = _lot_sizes_col.find_one(
         {
@@ -449,7 +450,7 @@ async def pt_create_portfolio(body: PTPortfolioIn, current_user: dict = Depends(
             return {"status": "success", "id": str(existing["_id"]), "created": False}
         result = _simulator_portfolio_col.insert_one({
             "name": body.name,
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
         return {"status": "success", "id": str(result.inserted_id), "created": True}
     except Exception as exc:
@@ -562,7 +563,7 @@ async def pt_save_strategy_alert_config(strategy_id: str, body: PTStrategyAlertC
                 pos["tp_mode"] = risk.tp_mode
                 pos["tp_value"] = risk.tp_value
 
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _simulator_strategy_col.update_one(
             {"_id": ObjectId(strategy_id)},
             {"$set": {
@@ -625,7 +626,7 @@ async def pt_save_strategy_sl_marker(strategy_id: str, body: PTStrategySlMarkerI
     try:
         if not _find_owned_strategy(strategy_id, current_user):
             return {"status": "error", "message": "Not found"}
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         result = _simulator_strategy_col.update_one(
             {"_id": ObjectId(strategy_id)},
             {"$set": {

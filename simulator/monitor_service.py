@@ -4,7 +4,7 @@ import asyncio
 import threading
 import uuid
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from bson import ObjectId
@@ -356,7 +356,7 @@ class SimulatorMonitorService:
             self._engine = engine
             self._controller = controller
             self._session_id = session_id
-            self._started_at = datetime.now().isoformat(timespec="seconds")
+            self._started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._stopped_at = ""
             self._last_event = "starting"
             self._last_event_at = ""

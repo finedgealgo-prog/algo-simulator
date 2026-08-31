@@ -16,7 +16,7 @@ starts this unconditionally on server boot.
 
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pymongo import MongoClient
 
@@ -84,12 +84,16 @@ class CryptoLiveOptionChainCollector:
 
     def _run_minute_loop(self) -> None:
         while not self._stop_event.is_set():
-            now = datetime.now()
+            # Explicit UTC, not naked datetime.now() — that reads the system
+            # clock's own timezone (IST on a local dev box, UTC in prod),
+            # silently storing IST-labeled-as-UTC minute buckets on a
+            # non-UTC machine. See project memory "utc-standardization".
+            now = datetime.now(timezone.utc)
             next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
             sleep_for = (next_minute - now).total_seconds()
             if self._stop_event.wait(timeout=max(sleep_for, 0.1)):
                 break
-            self._take_snapshot(next_minute.strftime("%Y-%m-%dT%H:%M:00"))
+            self._take_snapshot(next_minute.strftime("%Y-%m-%dT%H:%M:00Z"))
 
     def _fetch_chain(self, underlying: str, expiry: str) -> dict | None:
         """Chain for one underlying+expiry — same live-WS-first,
@@ -183,7 +187,7 @@ class CryptoLiveOptionChainCollector:
         the next minute boundary. Covers every expiry/strike, same as the
         periodic loop. Bypasses the _last_written_minute dedup guard on
         purpose, same as the NSE collector's snapshot_now."""
-        minute_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:00")
+        minute_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00Z")
         docs = self._build_snapshot_docs(minute_ts)
         if not docs:
             return {

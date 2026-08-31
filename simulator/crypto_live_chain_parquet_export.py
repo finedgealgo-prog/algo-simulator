@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
@@ -70,7 +70,11 @@ def _fetch_day(coll, underlying: str, day: str) -> tuple[pl.DataFrame, list]:
 
 def _transform(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
-        pl.col("timestamp").str.to_datetime("%Y-%m-%dT%H:%M:%S"),
+        # Strip a trailing UTC 'Z' marker if present — the writer
+        # (crypto_live_option_chain_collector.py) now stamps it, but rows
+        # written before that fix (or not yet backfilled by the migration
+        # script) won't have it; strict %S-only parsing must accept both.
+        pl.col("timestamp").str.strip_suffix("Z").str.to_datetime("%Y-%m-%dT%H:%M:%S"),
         pl.col("expiry").str.to_date(),
         pl.col("type").alias("option_type"),
         pl.col("strike").round(0).cast(pl.Int32),
@@ -153,14 +157,15 @@ def _delete_day(coll, ids: list) -> int:
 
 
 def export_today(underlying: str, delete_after: bool = False, day: str | None = None) -> dict:
-    """Export one underlying's rows for `day` (default: today, UTC — this
-    box's server-local time) to Parquet. delete_after=True also batch-
+    """Export one underlying's rows for `day` (default: today, explicit UTC
+    — not this box's system clock, see features.nse_market_hours) to
+    Parquet. delete_after=True also batch-
     deletes the exported Mongo rows once the Parquet write has actually
     succeeded — only ever pass True from export_and_clear_yesterday (the
     daily auto path); the Admin 'Convert Now' button always calls this with
     delete_after=False, same convention as the NSE exporter."""
     underlying = underlying.strip().upper()
-    day = day or datetime.now().strftime("%Y-%m-%d")
+    day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     year, month = int(day[:4]), int(day[5:7])
 
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -202,7 +207,7 @@ def export_and_clear_yesterday() -> dict:
     deletes another underlying's data."""
     from simulator.crypto_live_option_chain_collector import crypto_collector
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     underlyings = crypto_collector.status().get("underlyings") or []
     results = [export_today(u, delete_after=True, day=yesterday) for u in underlyings]
     ok = sum(1 for r in results if r["ok"])

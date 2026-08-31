@@ -71,7 +71,7 @@ delta_live_quote_socket_router = APIRouter(prefix="/simulator/crypto")
 
 
 def _now_iso() -> str:
-    return datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _parse_delta_symbol(symbol: str) -> dict | None:

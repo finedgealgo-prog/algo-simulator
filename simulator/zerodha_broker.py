@@ -221,7 +221,7 @@ class ZerodhaBroker:
                 time.sleep(0.35)   # throttle — stay within Kite rate limits
 
         # 6. Build result rows (same schema as MongoDB option_chain collection)
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(datetime.timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:00")
 
         rows = []

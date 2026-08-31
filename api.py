@@ -61,6 +61,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
+from features.nse_market_hours import nse_trade_date
 from features.backtest_engine import run_backtest
 from features.portfolio_worker import strategy_worker
 from features.mongo_data     import MongoData
@@ -196,7 +197,7 @@ def _default_runtime_trade_date(value: str | None = None, date_hint: str | None 
         return normalized_date
     normalized_mode = _normalize_runtime_activation_mode(value)
     if normalized_mode in {"live", "fast-forward", "forward-test"}:
-        return datetime.now(IST).strftime("%Y-%m-%d")
+        return nse_trade_date()
     return ""
 
 
@@ -629,9 +630,11 @@ def _shift_datetime_string_by_minutes(value: Any, minutes: int) -> Any:
     if parsed_value is None:
         return value
     shifted_value = parsed_value - timedelta(minutes=minutes)
-    if "." in str(value or ""):
-        return shifted_value.strftime("%Y-%m-%d %H:%M:%S.%f")
-    return shifted_value.strftime("%Y-%m-%d %H:%M:%S")
+    # Always output true-UTC 'T...Z' regardless of the input's own format —
+    # every "now" source on this platform is true UTC already (see the
+    # UTC-standardization plan), so an old un-migrated/space-separated
+    # input's *value* is still correct UTC; only its label was ever wrong.
+    return shifted_value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{shifted_value.microsecond // 1000:03d}Z"
 
 
 def _load_strategy_time_difference_minutes(db: MongoData, activation_mode: str) -> int:
@@ -748,7 +751,7 @@ def _resolve_daily_portfolio(
     normalized_mode = _normalize_runtime_activation_mode(activation_mode)
     trade_date = _default_runtime_trade_date(normalized_mode, str(trade_date_hint or "").strip()[:10])
     if not trade_date:
-        trade_date = datetime.now(IST).strftime("%Y-%m-%d")
+        trade_date = nse_trade_date()
     normalized_trade_index = _extract_trade_index(trade_index)
 
     collection = db._db[ALGO_TRADE_PORTFOLIO_COLLECTION]
@@ -1520,7 +1523,7 @@ def _run_stock_sync_from_dhan() -> dict:
 def _bg_stock_sync() -> None:
     global _stock_sync_state
     _stock_sync_state["running"] = True
-    _stock_sync_state["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _stock_sync_state["started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     _stock_sync_state["finished_at"] = ""
     _stock_sync_state["result"] = None
     _stock_sync_state["error"] = ""
@@ -1530,7 +1533,7 @@ def _bg_stock_sync() -> None:
         _stock_sync_state["error"] = str(exc)
     finally:
         _stock_sync_state["running"] = False
-        _stock_sync_state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _stock_sync_state["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @app.get("/algo/sync-stocks-from-dhan")
@@ -3224,7 +3227,7 @@ def _ensure_default_simulator_portfolios() -> None:
         if not col.find_one({"name": portfolio_name}, {"_id": 1}):
             col.insert_one({
                 "name": portfolio_name,
-                "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
 
 
@@ -3664,7 +3667,7 @@ async def simulator_get_option_chain(timestamp: str = Query(...)) -> dict:
 @sim_router.get("/simulator/lot-size")
 async def simulator_get_lot_size(instrument: str = "nifty") -> dict:
     try:
-        today = datetime.now(IST).strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         symbol = str(instrument or "nifty").upper()
         doc = _shared_mongo._db["lot_sizes"].find_one(
             {
@@ -3873,7 +3876,7 @@ def _fetch_manual_order_kite_cache(raw_db, kite_doc: dict | None) -> dict[tuple,
     a real Kite account is configured for placing this order.
     """
     global _manual_order_kite_cache, _manual_order_kite_cache_date
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _manual_order_kite_cache_date == today and _manual_order_kite_cache:
         return _manual_order_kite_cache
 
@@ -4726,7 +4729,7 @@ async def simulator_pt_create_portfolio(body: PTPortfolioIn, current_user: dict 
             return {"status": "success", "id": str(existing["_id"]), "created": False}
         result = col.insert_one({
             "name": body.name,
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "user_id": current_user_id,
         })
         return {"status": "success", "id": str(result.inserted_id), "created": True}
@@ -4746,7 +4749,7 @@ async def simulator_pt_save_trigger(body: PTTriggerIn, current_user: dict = Depe
     """
     try:
         col = _shared_mongo._db["simulator_triggers"]
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         col.update_one(
             {"broker_id": body.broker_id, "leg_id": body.leg_id},
             {
@@ -4781,7 +4784,7 @@ async def simulator_pt_save_portfolio_trigger(body: PTPortfolioTriggerIn, curren
     """
     try:
         col = _shared_mongo._db["simulator_portfolio_triggers"]
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         snapshot = sorted(
             ({"leg_id": s.leg_id, "quantity": s.quantity} for s in body.legs_snapshot if s.quantity > 0),
             key=lambda s: s["leg_id"],
@@ -4845,7 +4848,7 @@ async def simulator_pt_save_alert_config(body: PTAlertConfigIn, current_user: di
     """
     try:
         col = _shared_mongo._db["simulator_portfolio_triggers"]
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         snapshot = [s.model_dump() for s in body.legs_snapshot if s.quantity > 0]
         col.update_one(
             {"broker_id": body.broker_id, "underlying": body.underlying},
@@ -4902,7 +4905,7 @@ async def simulator_pt_list_adjustments(
 @sim_router.post("/simulator/paper-trade/adjustments")
 async def simulator_pt_create_adjustment(body: PTAdjustmentIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
     try:
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         doc = body.model_dump()
         doc["created_at"] = now_str
         doc["updated_at"] = now_str
@@ -4915,7 +4918,7 @@ async def simulator_pt_create_adjustment(body: PTAdjustmentIn, current_user: dic
 @sim_router.patch("/simulator/paper-trade/adjustments/{adjustment_id}")
 async def simulator_pt_update_adjustment(adjustment_id: str, body: PTAdjustmentPatchIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
     try:
-        update: dict = {"updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")}
+        update: dict = {"updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         update["positions"] = [p.model_dump() for p in body.positions]
         # Editing and re-saving re-arms it — same record gets updated in place rather
         # than a new one created (see simulator_pt_create_adjustment/PTAdjustmentIn.status).
@@ -5026,7 +5029,7 @@ async def simulator_pt_create_webhook(body: PTWebhookIn, current_user: dict = De
             # notify (see _simulator_pt_webhook_fire_live_adjustment) — the saved-strategy
             # path instead reads user_id off the strategy doc itself.
             "user_id": current_user.get("_id"),
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": 1,
         }
         result = _shared_mongo._db["simulator_webhooks"].insert_one(doc)
@@ -5080,7 +5083,7 @@ async def simulator_pt_create_new_strategy_webhook(body: PTNewStrategyWebhookIn,
             "spot_price": body.spot_price,
             "config": body.config or {},
             "positions": [p.dict() for p in body.positions],
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": 1,
         }
         result = _shared_mongo._db["simulator_webhooks"].insert_one(doc)
@@ -5144,7 +5147,7 @@ async def simulator_pt_create_update_strategy_webhook(
             "broker_id":    str(body.broker_id).strip() if trade_status == "live" and body.broker_id else None,
             "user_id":      current_user.get("_id"),
             "positions":    [p.dict() for p in body.positions],
-            "created_at":   datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at":   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status":       1,
         }
         result = _shared_mongo._db["simulator_webhooks"].insert_one(doc)
@@ -5287,7 +5290,7 @@ async def simulator_pt_list_new_positions(current_user: dict = Depends(app_auth.
         # to today (IST), so the page doesn't keep piling up every trigger ever fired.
         # triggered_at is stored as a "%Y-%m-%dT%H:%M:%S" string, so plain lexicographic
         # $gte/$lt bounds work fine.
-        now_ist = datetime.now(IST)
+        now_ist = datetime.now(timezone.utc)
         today_start = now_ist.strftime("%Y-%m-%dT00:00:00")
         tomorrow_start = (now_ist + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
         conditions.append({"$or": [
@@ -5345,7 +5348,7 @@ async def simulator_pt_list_new_positions(current_user: dict = Depends(app_auth.
                 resulting_strategy_id = str(strategy_doc["_id"]) if strategy_doc else None
                 item["status"] = 2
                 item["resulting_strategy_id"] = resulting_strategy_id
-                item["triggered_at"] = item["triggered_at"] or datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+                item["triggered_at"] = item["triggered_at"] or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             result.append(item)
         return {"status": "success", "new_positions": result}
     except Exception as exc:
@@ -5475,7 +5478,7 @@ async def _simulator_pt_webhook_create_strategy(webhook_doc: dict) -> dict:
         # open_positions[i]; open_positions holds the same dict objects as positions, so
         # mutating here is reflected in what _insert_simulator_strategy saves below. A
         # failed leg (result["status"] != "success", no "price") is left untouched.
-        fire_time = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        fire_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for leg_result, p in zip(order_result.get("results") or [], open_positions):
             if leg_result.get("status") == "success" and leg_result.get("price"):
                 p["entry_price"] = round(float(leg_result["price"]), 2)
@@ -5489,7 +5492,7 @@ async def _simulator_pt_webhook_create_strategy(webhook_doc: dict) -> dict:
         # a broker.
         open_positions = [p for p in positions if not p.get("exited")]
         raw_db = _shared_mongo._db
-        fire_time = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        fire_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         paper_legs = [
             ManualOrderLeg(
                 underlying=instrument,
@@ -5546,7 +5549,7 @@ async def _simulator_pt_webhook_create_strategy(webhook_doc: dict) -> dict:
                 {"$set": {
                     "status": 2,
                     "resulting_strategy_id": strategy_id,
-                    "triggered_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                    "triggered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }},
             )
         except Exception as mirror_exc:
@@ -5575,7 +5578,7 @@ def _net_pt_positions(existing: list[dict], incoming: list[dict]) -> list[dict]:
     """
     from datetime import datetime as _dt
     result = [dict(p) for p in existing]
-    now_iso = _dt.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_iso = _dt.now(IST).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for new_pos in incoming:
         if new_pos.get("exited"):
@@ -5654,7 +5657,7 @@ async def _simulator_pt_webhook_update_strategy(webhook_doc: dict) -> dict:
             {"_id": ObjectId(strategy_id)},
             {"$set": {
                 "positions":  merged,
-                "updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }},
         )
         strategy_name = str(doc.get("strategy_name") or "Strategy")
@@ -5736,7 +5739,7 @@ async def _simulator_pt_webhook_fire_live_adjustment(webhook_doc: dict) -> dict:
         for p in open_positions
     ]
     order_result = await _place_manual_order_via_order_service(broker_id, orders)
-    now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if order_result.get("status") not in ("success", "partial"):
         message = order_result.get("message") or "Order placement failed."
         adjustments_col.update_one(
@@ -6050,7 +6053,7 @@ async def simulator_pt_futures_chain(instrument: str = "", current_user: dict = 
 
         option_col = raw_db['active_option_tokens']
         monthly_expiries = {c["expiry"] for c in future_contracts}
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         weekly_expiries = sorted(
             e for e in option_col.distinct("expiry", {"instrument": normalized, "broker": "dhan"})
             if e >= today_str and e not in monthly_expiries
@@ -6453,7 +6456,7 @@ async def simulator_pt_update_strategy(strategy_id: str, body: PTStrategyIn, cur
         if not portfolio:
             result = portfolio_col.insert_one({
                 "name": body.portfolio_name,
-                "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "user_id": current_user_id,
             })
             portfolio_id = result.inserted_id
@@ -6475,7 +6478,7 @@ async def simulator_pt_update_strategy(strategy_id: str, body: PTStrategyIn, cur
                 "spot_price": body.spot_price,
                 "config": body.config or {},
                 "positions": positions,
-                "updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }},
         )
         if result.matched_count == 0:
@@ -6603,7 +6606,7 @@ def _sim_sub_effective_status(sub_doc: Optional[dict]) -> int:
     if sub_doc.get("status") == SIM_SUB_STATUS_CANCELLED:
         return SIM_SUB_STATUS_CANCELLED
     expires_at = sub_doc.get("expires_at")
-    now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if expires_at and expires_at < now_str:
         return SIM_SUB_STATUS_EXPIRED
     return SIM_SUB_STATUS_ACTIVE
@@ -6798,13 +6801,13 @@ def _insert_simulator_strategy(
     if not portfolio:
         inserted = portfolio_col.insert_one({
             "name": portfolio_name,
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "user_id": user_id,
         })
         portfolio_id = inserted.inserted_id
     else:
         portfolio_id = portfolio["_id"]
-    now_iso = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     initial_pos_history = [{
         "action": "INITIAL_SAVE",
         "time": now_iso,
@@ -7534,7 +7537,7 @@ async def simulator_admin_get_user_sim_plan(user_id: str, product: str = SIM_PRO
     if not sub_doc:
         free_plan = _sim_find_plan(free_slug)
         free_name = free_plan.get("plan_name", "Free") if free_plan else "Free"
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             user_ref: Any = ObjectId(user_id)
         except Exception:
@@ -7595,7 +7598,7 @@ async def simulator_admin_cancel_user_sim_plan(user_id: str, product: str = SIM_
         raise HTTPException(status_code=404, detail="No active sim plan found for this user")
     subs_col.update_one(
         {"_id": current["_id"]},
-        {"$set": {"status": SIM_SUB_STATUS_CANCELLED, "updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")}},
+        {"$set": {"status": SIM_SUB_STATUS_CANCELLED, "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}},
     )
     return {"ok": True}
 
@@ -7639,9 +7642,9 @@ async def simulator_admin_grant_sim_plan(payload: dict) -> dict:
     # product than the plan it's actually granting.
     product = plan_doc.get("product") or product
 
-    now = datetime.now(IST)
-    now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
-    expires_at = (now + timedelta(days=validity_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at = (now + timedelta(days=validity_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Support both ObjectId and string storage — try ObjectId first
     try:
@@ -8081,7 +8084,7 @@ def _get_dhan_scrip_master_rows() -> list[dict]:
     so the file is fetched at most once a day no matter how many instruments sync.
     """
     import io as _io, csv as _csv, requests as _req
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _DHAN_SCRIP_MASTER_CACHE.get("rows") and _DHAN_SCRIP_MASTER_CACHE.get("date") == today_str:
         return _DHAN_SCRIP_MASTER_CACHE["rows"]
 
@@ -8186,7 +8189,7 @@ def _get_dhan_index_option_master() -> dict[str, list[dict]]:
     scrip master CSV. The CSV is ~30MB, so it's downloaded once per calendar day and
     reused for every call that day, same caching shape as _get_dhan_fno_master() above.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _DHAN_INDEX_OPTION_CACHE.get("rows") and _DHAN_INDEX_OPTION_CACHE.get("date") == today_str:
         return _DHAN_INDEX_OPTION_CACHE["rows"]
 
@@ -8239,7 +8242,7 @@ def _get_dhan_index_future_master() -> dict[str, list[dict]]:
     (they only ever kept OPTSTK/OPTIDX), so there's no Mongo collection to query —
     this reads the CSV directly instead, same as the option masters do.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _DHAN_INDEX_FUTURE_CACHE.get("rows") and _DHAN_INDEX_FUTURE_CACHE.get("date") == today_str:
         return _DHAN_INDEX_FUTURE_CACHE["rows"]
 
@@ -8376,7 +8379,7 @@ def _sync_dhan_index_option_tokens(instrument: str) -> dict:
     try:
         col = db._db["active_option_tokens"]
         _ensure_active_option_tokens_index(col)
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
         expiries: set[str] = set()
         ops = []
         for c in contracts:
@@ -8458,7 +8461,7 @@ def _sync_dhan_index_future_tokens(instrument: str) -> dict:
     try:
         col = db._db["active_option_tokens"]
         _ensure_active_option_tokens_index(col)
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
         expiries: set[str] = set()
         ops = []
         for c in contracts:
@@ -8519,7 +8522,7 @@ def _get_dhan_commodity_master() -> dict[str, list[dict]]:
     on futures (OPTFUT, opt_type CE/PE). Underlyings aren't a fixed list like the indices;
     they're discovered straight from whatever Dhan's scrip master actually carries.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _DHAN_COMMODITY_MASTER_CACHE.get("rows") and _DHAN_COMMODITY_MASTER_CACHE.get("date") == today_str:
         return _DHAN_COMMODITY_MASTER_CACHE["rows"]
 
@@ -8579,7 +8582,7 @@ def _sync_dhan_commodity_tokens(instrument: str) -> dict:
     try:
         col = db._db["active_option_tokens"]
         _ensure_active_option_tokens_index(col)
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
         expiries: set[str] = set()
         ops = []
         for c in contracts:
@@ -8839,8 +8842,8 @@ def _process_flattrade_postback_payload(
                             "status": "COMPLETE",
                             "fill_price": float(fill_price or 0),
                             "fill_qty": int(fill_qty or 0),
-                            "filled_at": datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
-                            "updated_at": datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                            "filled_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                            "updated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                         }},
                     )
                     _sync_live_exit_fill(local_db, trade_id, leg_id, exit_reason, fill_price)
@@ -9534,7 +9537,7 @@ def _start_monitor_services(trade_date: str = '') -> dict:
     import threading
     import asyncio
 
-    normalized_trade_date = str(trade_date or '').strip() or datetime.now().strftime('%Y-%m-%d')
+    normalized_trade_date = str(trade_date or '').strip() or nse_trade_date()
     print(
         f'[MONITOR START REQUEST] '
         f'trade_date={normalized_trade_date} '
@@ -9559,10 +9562,10 @@ def _build_monitor_status_payload() -> dict:
     supervisor_status = live_fast_monitor_supervisor.get_status()
     ticker_status = ticker_manager.get_status()
     return {
-        'server_time': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+        'server_time': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'running': bool(supervisor_status.get('running')),
         'monitor_status': 'running' if bool(supervisor_status.get('running')) else 'stopped',
-        'trade_date': str(supervisor_status.get('trade_date') or datetime.now().strftime('%Y-%m-%d')),
+        'trade_date': str(supervisor_status.get('trade_date') or nse_trade_date()),
         'started_at': str(supervisor_status.get('started_at') or ''),
         'last_tick_at': str(supervisor_status.get('last_tick_at') or ''),
         'last_refresh_at': str(supervisor_status.get('last_refresh_at') or ''),
@@ -9622,7 +9625,7 @@ def _build_live_ltp_payload(active_contracts: list[dict], now_ts: str) -> list[d
 def _save_market_kite_session(session: dict) -> None:
     api_key = session.get("api_key") or str(getattr(get_kite_instance(), "api_key", "") or "").strip()
     access_token = session.get("access_token")
-    login_time = datetime.now().isoformat()
+    login_time = datetime.now(timezone.utc).isoformat()
     update_fields = {
         "broker": "kite",
         "api_key": api_key,
@@ -9659,7 +9662,7 @@ def _clear_market_kite_session() -> None:
     try:
         local_db._db["kite_market_config"].update_one(
             {"enabled": True},
-            {"$set": {"access_token": "", "login_time": datetime.now().isoformat()}},
+            {"$set": {"access_token": "", "login_time": datetime.now(timezone.utc).isoformat()}},
             upsert=True,
         )
     finally:
@@ -10055,7 +10058,7 @@ def _build_monitor_action_page(*, running: bool, trade_date: str = '') -> str:
     button_label = 'Stop Listening' if running else 'Start Listening'
     button_href = '/monitor/stop' if running else '/monitor/start'
     button_class = 'danger' if running else 'success'
-    trade_date_text = str(trade_date or '').strip() or datetime.now().strftime('%Y-%m-%d')
+    trade_date_text = str(trade_date or '').strip() or nse_trade_date()
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10529,7 +10532,7 @@ def _sync_active_option_tokens(instrument: str) -> dict:
     if not normalized_instrument:
         raise HTTPException(status_code=400, detail="Instrument is required")
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     db = MongoData()
     try:
         credentials_loaded = load_credentials_from_db(db)
@@ -10549,7 +10552,7 @@ def _sync_active_option_tokens(instrument: str) -> dict:
 
         # Special case: iterate ALL non-index FNO stock underlyings
         if normalized_instrument == "FNO-STOCKS":
-            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
             created_count = 0
             updated_count = 0
             contracts_processed = 0
@@ -10670,7 +10673,7 @@ def _sync_active_option_tokens(instrument: str) -> dict:
                 ),
             }
 
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
         created_count = 0
         updated_count = 0
         contracts_processed = 0
@@ -11275,7 +11278,7 @@ def _run_bg_sync(instrument: str) -> None:
     global _bg_sync_state
     _bg_sync_state["running"] = True
     _bg_sync_state["instrument"] = instrument
-    _bg_sync_state["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _bg_sync_state["started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     _bg_sync_state["finished_at"] = ""
     _bg_sync_state["result"] = None
     _bg_sync_state["error"] = ""
@@ -11286,7 +11289,7 @@ def _run_bg_sync(instrument: str) -> None:
         _bg_sync_state["error"] = str(exc)
     finally:
         _bg_sync_state["running"] = False
-        _bg_sync_state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _bg_sync_state["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 

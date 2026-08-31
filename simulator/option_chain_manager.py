@@ -178,11 +178,19 @@ class OptionChainManager:
         Args:
             start_date:   "YYYY-MM-DD"
             end_date:     "YYYY-MM-DD"
-            daily_cutoff: "HH:MM"  — position_end_time, no ticks after this
+            daily_cutoff: "HH:MM" IST — position_end_time, user-facing
+                          strategy config (stays IST for readability), no
+                          ticks after this
             timeframe:    "1m" | "5m" | "10m" ... minute step used by the UI
+
+        stock_data.option_chain is stored as true UTC (Phase D of the
+        UTC-standardization plan) — daily_cutoff is converted to its UTC
+        clock-face equivalent here, once, at the comparison boundary, so the
+        user-facing config itself never has to change.
         """
         resolved_start = self._calendar.resolve_start_date(start_date)
         step_minutes = self._parse_timeframe_minutes(timeframe)
+        daily_cutoff = self._ist_hhmm_to_utc_hhmm(daily_cutoff)
 
         trading_days: set[str] = set(
             self._calendar.get_trading_days(resolved_start, end_date)
@@ -230,6 +238,18 @@ class OptionChainManager:
         except Exception:
             return True
         return minute % step_minutes == 0
+
+    @staticmethod
+    def _ist_hhmm_to_utc_hhmm(hhmm: str) -> str:
+        """'15:15' (IST) -> '09:45' (UTC). Used once per backtest run to
+        convert user-facing strategy config to the clock-face this reader's
+        UTC-stored timestamps use — see get_backtest_timestamps."""
+        try:
+            h, m = (int(x) for x in str(hhmm or "").strip().split(":")[:2])
+        except (ValueError, IndexError):
+            return hhmm
+        total = (h * 60 + m - 330) % 1440
+        return f"{total // 60:02d}:{total % 60:02d}"
 
     @staticmethod
     def _extract_time(ts: str) -> str:

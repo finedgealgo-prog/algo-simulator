@@ -153,7 +153,7 @@ def _ensure_default_crypto_simulator_portfolios() -> None:
         if not col.find_one({"name": portfolio_name}, {"_id": 1}):
             col.insert_one({
                 "name": portfolio_name,
-                "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
 
 
@@ -323,13 +323,13 @@ def _insert_crypto_simulator_strategy(
     if not portfolio:
         inserted = portfolio_col.insert_one({
             "name": portfolio_name,
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "user_id": user_id,
         })
         portfolio_id = inserted.inserted_id
     else:
         portfolio_id = portfolio["_id"]
-    now_iso = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     initial_pos_history = [{
         "action": "INITIAL_SAVE",
         "time": now_iso,
@@ -555,15 +555,14 @@ async def crypto_pt_get_executed_group(group_id: str, current_user: dict = Depen
         trade_ids = [str(t["_id"]) for t in trades]
 
         hist_col = _shared_mongo._db[COL_POSITIONS_HIST]
-        # entry_trade/exit_trade.traded_timestamp are IST civil time (execution_socket.py
-        # writes them via datetime.now(IST), same convention this file's own IST constant
-        # exists for) — naive, no tzinfo. Comparing that against a naive UTC "now" silently
-        # misjudged a leg as still-open for up to 5.5 hours after it had actually already
-        # exited (verified against a real leg: exit_trade present with a real fill price,
-        # but exit_dt in the future relative to UTC "now" made exited come back False).
-        # parse_timestamp strips tzinfo (see its docstring), so match its naive domain by
-        # dropping IST's own offset here too, rather than leaving it UTC.
-        now_dt = datetime.now(IST).replace(tzinfo=None)
+        # entry_trade/exit_trade.traded_timestamp are true UTC (execution_socket.py
+        # writes them via datetime.now(timezone.utc) — see the platform-wide
+        # UTC-standardization plan) — naive once parse_timestamp strips the
+        # 'Z' marker (see its docstring), so match its naive-UTC domain here
+        # rather than IST. (This block previously matched an IST-naive
+        # traded_timestamp before that writer was fixed — updated in step
+        # with it, not independently re-derived.)
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
         positions: list[dict] = []
         for doc in hist_col.find({"trade_id": {"$in": trade_ids}}):
             entry_trade = doc.get("entry_trade") if isinstance(doc.get("entry_trade"), dict) else {}
@@ -647,7 +646,7 @@ async def crypto_pt_update_strategy(strategy_id: str, body: PTStrategyIn, curren
         if not portfolio:
             result = portfolio_col.insert_one({
                 "name": body.portfolio_name,
-                "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "user_id": current_user_id,
             })
             portfolio_id = result.inserted_id
@@ -669,7 +668,7 @@ async def crypto_pt_update_strategy(strategy_id: str, body: PTStrategyIn, curren
                 "spot_price": body.spot_price,
                 "config": body.config or {},
                 "positions": positions,
-                "updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }},
         )
         if result.matched_count == 0:
@@ -762,7 +761,7 @@ async def crypto_pt_create_portfolio(body: PTPortfolioIn, current_user: dict = D
             return {"status": "success", "id": str(existing["_id"]), "created": False}
         result = col.insert_one({
             "name": body.name,
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "user_id": current_user_id,
         })
         return {"status": "success", "id": str(result.inserted_id), "created": True}
@@ -801,7 +800,7 @@ async def crypto_pt_list_new_positions(current_user: dict = Depends(app_auth.get
         conditions: list[dict[str, Any]] = []
         if current_user_id is not None:
             conditions.append({"$or": [{"user_id": current_user_id}, {"user_id": {"$exists": False}}]})
-        now_ist = datetime.now(IST)
+        now_ist = datetime.now(timezone.utc)
         today_start = now_ist.strftime("%Y-%m-%dT00:00:00")
         tomorrow_start = (now_ist + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
         conditions.append({"$or": [
@@ -854,7 +853,7 @@ async def crypto_pt_list_new_positions(current_user: dict = Depends(app_auth.get
                 resulting_strategy_id = str(strategy_doc["_id"]) if strategy_doc else None
                 item["status"] = 2
                 item["resulting_strategy_id"] = resulting_strategy_id
-                item["triggered_at"] = item["triggered_at"] or datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+                item["triggered_at"] = item["triggered_at"] or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             result.append(item)
         return {"status": "success", "new_positions": result}
     except Exception as exc:
@@ -922,7 +921,7 @@ async def crypto_pt_list_adjustments(
 async def crypto_pt_create_adjustment(body: PTAdjustmentIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
     """Mirrors api.py's simulator_pt_create_adjustment (api.py:4842-4852), crypto_ collection."""
     try:
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         doc = body.model_dump()
         doc["created_at"] = now_str
         doc["updated_at"] = now_str
@@ -936,7 +935,7 @@ async def crypto_pt_create_adjustment(body: PTAdjustmentIn, current_user: dict =
 async def crypto_pt_update_adjustment(adjustment_id: str, body: PTAdjustmentPatchIn, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
     """Mirrors api.py's simulator_pt_update_adjustment (api.py:4855-4875), crypto_ collection."""
     try:
-        update: dict = {"updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")}
+        update: dict = {"updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         update["positions"] = [p.model_dump() for p in body.positions]
         # Editing and re-saving re-arms it — same record gets updated in place rather
         # than a new one created (see crypto_pt_create_adjustment/PTAdjustmentIn.status).
@@ -979,7 +978,7 @@ async def crypto_pt_save_trigger(body: PTTriggerIn, current_user: dict = Depends
     """Mirrors api.py's simulator_pt_save_trigger (api.py:4696-4727), crypto_ collection."""
     try:
         col = _shared_mongo._db[CRYPTO_TRIGGERS_COLLECTION]
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         col.update_one(
             {"broker_id": body.broker_id, "leg_id": body.leg_id},
             {
@@ -1026,7 +1025,7 @@ async def crypto_pt_save_alert_config(body: PTAlertConfigIn, current_user: dict 
     """Mirrors api.py's simulator_pt_save_alert_config (api.py:4791+), crypto_ collection."""
     try:
         col = _shared_mongo._db[CRYPTO_PORTFOLIO_TRIGGERS_COLLECTION]
-        now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         snapshot = sorted(
             ({"leg_id": s.leg_id, "quantity": s.quantity, "entry_price": s.entry_price, "side": s.side} for s in body.legs_snapshot),
             key=lambda s: s["leg_id"],
@@ -1147,7 +1146,7 @@ async def crypto_pt_create_webhook(body: PTWebhookIn, current_user: dict = Depen
             # saved-strategy path instead reads user_id off the strategy doc itself, same
             # split NSE's simulator_pt_create_webhook uses.
             "user_id": current_user.get("_id"),
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": 1,
         }
         result = _shared_mongo._db[CRYPTO_WEBHOOKS_COLLECTION].insert_one(doc)
@@ -1182,7 +1181,7 @@ async def crypto_pt_create_new_strategy_webhook(body: PTNewStrategyWebhookIn, cu
             "spot_price": body.spot_price,
             "config": body.config or {},
             "positions": [p.dict() for p in body.positions],
-            "created_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": 1,
         }
         result = _shared_mongo._db[CRYPTO_WEBHOOKS_COLLECTION].insert_one(doc)
@@ -1237,7 +1236,7 @@ async def crypto_pt_create_update_strategy_webhook(
             "broker_id":    str(body.broker_id).strip() if trade_status == "live" and body.broker_id else None,
             "user_id":      current_user.get("_id"),
             "positions":    [p.dict() for p in body.positions],
-            "created_at":   datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "created_at":   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status":       1,
         }
         result = _shared_mongo._db[CRYPTO_WEBHOOKS_COLLECTION].insert_one(doc)
@@ -1420,7 +1419,7 @@ async def _crypto_webhook_create_strategy(webhook_doc: dict) -> dict:
             return {"status": "error", "message": order_result.get("message") or "Order placement failed.", "results": order_result.get("results")}
         extra_fields["broker_id"] = broker_id
         extra_fields["order_results"] = order_result.get("results")
-        fire_time = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+        fire_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for leg_result, p in zip(order_result.get("results") or [], open_positions):
             if leg_result.get("status") == "success" and leg_result.get("price"):
                 p["entry_price"] = round(float(leg_result["price"]), 2)
@@ -1454,7 +1453,7 @@ async def _crypto_webhook_create_strategy(webhook_doc: dict) -> dict:
                 {"$set": {
                     "status": 2,
                     "resulting_strategy_id": strategy_id,
-                    "triggered_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                    "triggered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }},
             )
         except Exception as mirror_exc:
@@ -1488,7 +1487,7 @@ async def _crypto_webhook_update_strategy(webhook_doc: dict) -> dict:
             {"_id": ObjectId(strategy_id)},
             {"$set": {
                 "positions":  merged,
-                "updated_at": datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }},
         )
         strategy_name = str(doc.get("strategy_name") or "Strategy")
@@ -1641,7 +1640,7 @@ async def _crypto_webhook_fire_live_adjustment(webhook_doc: dict) -> dict:
         for p in open_positions
     ]
     order_result = await _place_crypto_manual_order_via_order_service(broker_id, orders)
-    now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if order_result.get("status") not in ("success", "partial"):
         message = order_result.get("message") or "Order placement failed."
         adjustments_col.update_one(
