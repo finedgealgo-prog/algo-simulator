@@ -2190,6 +2190,18 @@ async def _auto_expiry_squareoff_catchup():
     asyncio.create_task(_run())
 
 
+@app.on_event("startup")
+async def _auto_start_crypto_expiry_squareoff():
+    """Crypto's own expiry square-off — see simulator/crypto_expiry_squareoff.py's
+    module docstring for why this is a separate always-on loop rather than a
+    branch on _auto_expiry_squareoff_catchup/simulator_risk_monitor above:
+    Delta settles at a real 12:00 UTC (not NSE's 15:29 IST convention) and
+    trades 24/7, so there's no startup-catch-up-vs-live-cutoff split needed —
+    one loop, running for the life of this process, covers both."""
+    import asyncio
+    from simulator.crypto_expiry_squareoff import run_crypto_expiry_squareoff_loop
+    asyncio.create_task(run_crypto_expiry_squareoff_loop())
+
 
 # Indicator-condition alerts (Supertrend/MACD/MA Cross/RSI/Stochastic) are
 # deliberately NOT auto-started here, unlike the price/trendline loop above
