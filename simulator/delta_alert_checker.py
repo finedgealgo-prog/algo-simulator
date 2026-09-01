@@ -593,13 +593,22 @@ _checker = _DeltaAlertChecker()
 async def start_delta_alert_checker_loop() -> None:
     """Call once from a FastAPI startup hook — runs forever for the life of
     the process. Unlike alert_checker.py's NSE loop, never registered with
-    market_hours_scheduler: Delta has no after-hours to auto-stop for."""
+    market_hours_scheduler: Delta has no after-hours to auto-stop for.
+
+    Tick-driven, same as alert_checker.py's NSE loop: wakes on
+    delta_ticker_manager.tick_event (set on every Delta WS tick) instead of
+    waiting the full POLL_INTERVAL_SECONDS — POLL_INTERVAL_SECONDS is now
+    just the safety-net ceiling (WS reconnect gap, etc.), not the real
+    cadence."""
+    from features.delta_exchange_ws import delta_ticker_manager
+
     while True:
         try:
             await asyncio.to_thread(_checker.run_cycle)
         except Exception:
             logger.exception("[delta_alert_checker] check cycle failed")
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.to_thread(delta_ticker_manager.tick_event.wait, POLL_INTERVAL_SECONDS)
+        delta_ticker_manager.tick_event.clear()
 
 
 async def start_delta_indicator_alert_scheduler_loop() -> None:
