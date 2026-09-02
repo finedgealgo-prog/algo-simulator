@@ -2144,29 +2144,41 @@ async def _auto_start_crypto_live_collector():
 async def _auto_crypto_chain_parquet_export_scheduler():
     """Daily archive+clear for the crypto live collector's Mongo rows —
     crypto has no NSE-style market close to hang this off, so instead this
-    fires once shortly after this process comes up, then again every 24h
-    from that point on — NOT pinned to a fixed wall-clock time (an earlier
-    version waited for the next 00:10 UTC, which meant a process that
-    reload/restarts after 00:10 has already passed for the day sits doing
-    nothing until the following day; startup-relative timing means it's
-    never more than a couple minutes from actually running, on any restart).
+    runs once a day pinned to a fixed wall-clock time: 12:00 UTC == 17:30
+    IST (2026-09-02, explicit user request — the earlier version fired
+    startup-relative, i.e. whenever the process happened to boot, then
+    every 24h from that point; that made the actual run time drift with
+    every restart/redeploy instead of landing at a predictable hour).
     Each run archives the PREVIOUS UTC day's BTC/ETH rows to Parquet and
     clears them from stock_data.option_chain (see crypto_live_chain_
     parquet_export.py's module docstring for why yesterday, never today —
     today's rows are still being written to, clearing them mid-day would be
-    wrong). Keeps that collection from growing unbounded the way it would
-    if every minute's BTC/ETH snapshot just accumulated forever."""
+    wrong; by 12:00 UTC the previous UTC day ended a full 12h earlier, so
+    it's always safely finished). Keeps that collection from growing
+    unbounded the way it would if every minute's BTC/ETH snapshot just
+    accumulated forever. Recomputes the next 12:00 UTC target every
+    iteration (rather than a blind +24h sleep) so a slow run or a missed
+    cycle can't drift the schedule."""
     import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    _TARGET_HHMM = (12, 0)  # UTC — 17:30 IST
+
+    def _seconds_until_next_target() -> float:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=_TARGET_HHMM[0], minute=_TARGET_HHMM[1], second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
 
     async def _run():
         from simulator.crypto_live_chain_parquet_export import export_and_clear_yesterday
-        await asyncio.sleep(120)  # let Mongo/collector startup settle first
         while True:
+            await asyncio.sleep(_seconds_until_next_target())
             try:
                 await asyncio.to_thread(export_and_clear_yesterday)
             except Exception:
                 log.exception("[CRYPTO LIVE CHAIN EXPORT] scheduled export+clear failed")
-            await asyncio.sleep(24 * 3600)
 
     asyncio.create_task(_run())
 
