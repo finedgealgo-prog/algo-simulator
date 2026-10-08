@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 import time
 from typing import Any
 
@@ -52,9 +54,27 @@ from features.delta_exchange_ws import delta_ticker_manager
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL_SECONDS = 2.0
+# POLL_INTERVAL_SECONDS is now only the slow reconcile/safety-net cadence
+# (catches a missed WS hook call, a fresh alert not yet in _ALERTS_CACHE,
+# or a reconnect gap) — the real hot path is on_underlying_tick() below,
+# called directly from delta_exchange_ws.py's WS thread per underlying, so
+# a BTC tick never re-evaluates ETH alerts (or vice versa). See module
+# docstring update + algo_signal_alert_engine_low_cpu_architecture doc.
+POLL_INTERVAL_SECONDS = 5.0
 ONCE_PER_MINUTE_COOLDOWN_MS = 60_000
 INDICATOR_SCHEDULER_MAX_SLEEP_SECONDS = 60.0
+_ALERTS_CACHE_TTL_SECONDS = 5.0
+
+# Trigger execution is decoupled from the tick hot path: on_underlying_tick
+# runs on delta_exchange_ws.py's WS receive thread, so it must never block
+# on a webhook HTTP call or Telegram send. The atomic claim (_try_claim)
+# still happens inline — it's a single indexed Mongo update, fast — but the
+# actual delivery work is hop-off'd onto a small fixed worker pool behind a
+# BOUNDED queue (never grows unbounded; a full queue drops-and-logs rather
+# than blocking the feed or piling up memory indefinitely).
+_TRIGGER_QUEUE_MAXSIZE = 500
+_TRIGGER_WORKER_COUNT = 4
+_trigger_queue: "queue.Queue[tuple[Any, ...]]" = queue.Queue(maxsize=_TRIGGER_QUEUE_MAXSIZE)
 
 _TRENDLINE_BARS_TTL_SECONDS = 60.0
 _TRENDLINE_BARS_RESOLUTION = "1"
@@ -229,6 +249,13 @@ class _DeltaAlertChecker:
         self._previous_sample: dict[str, tuple[float, float]] = {}
         self._trendline_bars_cache: dict[str, tuple[float, list[dict]]] = {}
         self._ensured_underlyings: set[str] = set()
+        # Per-underlying in-memory alert cache — the doc's "no Mongo read in
+        # the tick hot path" rule. on_underlying_tick() reads this instead of
+        # querying alerts_col on every tick; TTL is the staleness ceiling,
+        # invalidate_alert_cache() drops an entry immediately on create/
+        # update/delete so edits don't wait out the TTL.
+        self._alerts_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._alerts_cache_lock = threading.Lock()
 
     def _get_trendline_bars(self, symbol: str, trendline_alerts: list[dict]) -> list[dict]:
         now = time.time()
@@ -303,6 +330,54 @@ class _DeltaAlertChecker:
             bars = self._get_trendline_bars(symbol, trendline_alerts) if trendline_alerts else []
 
             self._check_alerts(symbol_alerts, prev_price, curr_price, now_ms, bars)
+
+    def _get_symbol_alerts(self, underlying: str, *, force: bool = False) -> list[dict]:
+        now = time.time()
+        with self._alerts_cache_lock:
+            cached = self._alerts_cache.get(underlying)
+            if not force and cached and now - cached[0] < _ALERTS_CACHE_TTL_SECONDS:
+                return cached[1]
+        db = MongoData()._db
+        alerts_col = db[ALERTS_COLLECTION]
+        alerts = list(alerts_col.find({"active": True, "symbol": underlying}))
+        with self._alerts_cache_lock:
+            self._alerts_cache[underlying] = (now, alerts)
+        return alerts
+
+    def invalidate_symbol_cache(self, underlying: str) -> None:
+        with self._alerts_cache_lock:
+            self._alerts_cache.pop(underlying, None)
+
+    def on_underlying_tick(self, underlying: str, curr_price: float, now_ms: float) -> None:
+        """Token-routed hot path — call directly (not via the poll loop) for
+        the SPECIFIC underlying that just ticked, e.g. from delta_exchange_
+        ws.py's WS message handler. A BTC tick only ever evaluates BTC
+        alerts, never ETH's, unlike the old design where any Delta tick woke
+        run_cycle() into rescanning both symbols' full alert sets.
+
+        Runs on the caller's thread (typically the WS receive thread) — must
+        stay cheap: in-memory cache read + the same crossing math run_cycle
+        already used, no Mongo read, no blocking webhook/Telegram call (see
+        _try_claim/_enqueue_trigger below for how firing is decoupled)."""
+        if not underlying or curr_price is None or curr_price <= 0:
+            return
+        try:
+            curr_price = float(curr_price)
+        except (TypeError, ValueError):
+            return
+
+        prev_price, _ = self._previous_sample.get(underlying, (None, None))
+        self._previous_sample[underlying] = (curr_price, now_ms)
+        if prev_price is None:
+            return
+
+        symbol_alerts = self._get_symbol_alerts(underlying)
+        if not symbol_alerts:
+            return
+
+        trendline_alerts = [a for a in symbol_alerts if a.get("sourceType") == "trendline"]
+        bars = self._get_trendline_bars(underlying, trendline_alerts) if trendline_alerts else []
+        self._check_alerts(symbol_alerts, prev_price, curr_price, now_ms, bars)
 
     def get_active_indicator_resolutions(self) -> set[str]:
         db = MongoData()._db
@@ -452,8 +527,16 @@ class _DeltaAlertChecker:
             if alert.get("triggerMode") == "once_only":
                 field_updates["active"] = False
 
-            self._fire_alert(alert, "indicator", float(trigger_price), field_updates)
-            self._persist_update(alert_id, field_updates)
+            claim_filter = {
+                "$or": [
+                    {"lastIndicatorSignalBarTime": {"$exists": False}},
+                    {"lastIndicatorSignalBarTime": {"$lt": bar_time}},
+                ]
+            }
+            claimed = self._try_claim(alert_id, claim_filter, field_updates)
+            if claimed is None:
+                continue
+            _enqueue_trigger(self, claimed, "indicator", float(trigger_price), field_updates)
 
     def _check_alerts(
         self,
@@ -510,8 +593,27 @@ class _DeltaAlertChecker:
             if trigger_mode == "once_only":
                 field_updates["active"] = False
 
-            self._fire_alert(alert, direction, trigger_price, field_updates)
-            self._persist_update(alert_id, field_updates)
+            # Atomic trigger claim (ARMED -> TRIGGER_CLAIMED): guard the fire
+            # against a concurrent evaluation of the same crossing/cooldown/
+            # once-only edge — old code fired then persisted, which could
+            # double-fire under overlapping cycles. crossPrimed/once_per_
+            # minute alerts re-validate their arm/cooldown state against
+            # Mongo's CURRENT value, not the (possibly briefly stale,
+            # cached) `alert` dict.
+            claim_filter: dict[str, Any] = {}
+            if "crossPrimed" in field_updates:
+                claim_filter["crossPrimed"] = True
+            if trigger_mode == "once_per_minute":
+                cooldown_cutoff = now_ms - ONCE_PER_MINUTE_COOLDOWN_MS
+                claim_filter["$or"] = [
+                    {"lastTriggeredAt": {"$exists": False}},
+                    {"lastTriggeredAt": {"$lte": cooldown_cutoff}},
+                ]
+
+            claimed = self._try_claim(alert_id, claim_filter, field_updates)
+            if claimed is None:
+                continue
+            _enqueue_trigger(self, claimed, direction, trigger_price, field_updates)
 
     def _fire_alert(self, alert: dict, direction: str, trigger_price: float, field_updates: dict) -> None:
         alert_name = alert.get("name") or "Alert"
@@ -566,9 +668,15 @@ class _DeltaAlertChecker:
         body = _resolve_message_placeholders(message, float(trigger_price) if trigger_price is not None else 0.0)
         result = _deliver_webhook(webhook_url, body)
 
-        field_updates["lastWebhookOk"] = result["ok"]
-        field_updates["lastWebhookStatus"] = result["status"]
-        field_updates["lastWebhookResponse"] = (result["responseText"] or "")[:2000]
+        # Informational-only fields (never guard a trigger decision), so a
+        # plain best-effort persist after delivery is fine here — unlike the
+        # ARMED/cooldown/once-only fields, which are already committed
+        # atomically by _try_claim() before this method ever runs.
+        self._persist_update(alert.get("id"), {
+            "lastWebhookOk": result["ok"],
+            "lastWebhookStatus": result["status"],
+            "lastWebhookResponse": (result["responseText"] or "")[:2000],
+        })
 
         if result["ok"]:
             logger.info("[delta_alert_checker] %s triggered (%s) — webhook delivered to %s", alert_name, direction, webhook_url)
@@ -577,6 +685,25 @@ class _DeltaAlertChecker:
                 "[delta_alert_checker] %s triggered (%s) — webhook FAILED (%s) to %s: %s",
                 alert_name, direction, result["status"], webhook_url, result["responseText"],
             )
+
+    def _try_claim(self, alert_id: str, extra_filter: dict, field_updates: dict) -> dict | None:
+        """Atomic compare-and-set trigger claim (doc: ARMED -> TRIGGER_
+        CLAIMED). `extra_filter` re-validates the arm/cooldown condition
+        against Mongo's CURRENT document, not the cached `alert` dict this
+        evaluation started from — only the caller whose extra_filter still
+        matches wins the update and may fire; everyone else (a concurrent
+        tick, a concurrent scheduler run) gets None and must not fire.
+        Returns the PRE-update document (pymongo's ReturnDocument.BEFORE
+        default) so the caller still has the alert's config fields to build
+        the notification/webhook from."""
+        db = MongoData()._db
+        alerts_col = db[ALERTS_COLLECTION]
+        claim_filter = {"id": alert_id, "active": True, **extra_filter}
+        try:
+            return alerts_col.find_one_and_update(claim_filter, {"$set": field_updates})
+        except Exception:
+            logger.exception("[delta_alert_checker] atomic trigger claim failed for alert %s", alert_id)
+            return None
 
     def _persist_update(self, alert_id: str, field_updates: dict) -> None:
         db = MongoData()._db
@@ -590,25 +717,95 @@ class _DeltaAlertChecker:
 _checker = _DeltaAlertChecker()
 
 
+# ── Decoupled trigger execution — bounded queue + fixed worker pool ────────
+# See module docstring / _TRIGGER_QUEUE_MAXSIZE above: on_underlying_tick()
+# runs on the Delta WS receive thread and must never block on a webhook HTTP
+# call, so the actual _fire_alert() delivery work happens here instead, off
+# that thread.
+
+def _enqueue_trigger(checker: "_DeltaAlertChecker", alert: dict, direction: str, trigger_price: float, field_updates: dict) -> None:
+    try:
+        _trigger_queue.put_nowait((checker, alert, direction, trigger_price, field_updates))
+    except queue.Full:
+        logger.error(
+            "[delta_alert_checker] trigger queue full (%d) — dropping fire for alert %s "
+            "(symbol=%s); webhook/Telegram delivery is falling behind",
+            _TRIGGER_QUEUE_MAXSIZE, alert.get("id"), alert.get("symbol"),
+        )
+
+
+def _trigger_worker_loop() -> None:
+    while True:
+        checker, alert, direction, trigger_price, field_updates = _trigger_queue.get()
+        try:
+            checker._fire_alert(alert, direction, trigger_price, field_updates)
+        except Exception:
+            logger.exception("[delta_alert_checker] trigger delivery failed for alert %s", alert.get("id"))
+        finally:
+            _trigger_queue.task_done()
+
+
+_trigger_workers_started = False
+_trigger_workers_lock = threading.Lock()
+
+
+def _ensure_trigger_workers_started() -> None:
+    global _trigger_workers_started
+    with _trigger_workers_lock:
+        if _trigger_workers_started:
+            return
+        for i in range(_TRIGGER_WORKER_COUNT):
+            threading.Thread(
+                target=_trigger_worker_loop,
+                name=f"delta-alert-trigger-{i}",
+                daemon=True,
+            ).start()
+        _trigger_workers_started = True
+
+
+# ── Public entry points for delta_exchange_ws.py / chart_api.py ────────────
+
+def on_underlying_tick(underlying: str, curr_price: float, now_ms: float) -> None:
+    """Call directly from the Delta WS tick handler for the underlying that
+    just ticked (see delta_exchange_ws.py's _dispatch_to_alert_engine). Lazy-
+    starts the trigger worker pool on first use so importing this module
+    alone never spins up threads."""
+    _ensure_trigger_workers_started()
+    _checker.on_underlying_tick(underlying, curr_price, now_ms)
+
+
+def invalidate_alert_cache(symbol: str | None) -> None:
+    """Best-effort cache-bust after an alert create/update/delete (see
+    shared/chart_api.py's save_chart_alert/delete_chart_alert) so an edit is
+    visible to on_underlying_tick() immediately instead of waiting out
+    _ALERTS_CACHE_TTL_SECONDS. Safe to call for a non-crypto symbol too —
+    it's just a dict.pop on an underlying that was never cached."""
+    if not symbol:
+        return
+    _checker.invalidate_symbol_cache(str(symbol).upper())
+
+
 async def start_delta_alert_checker_loop() -> None:
     """Call once from a FastAPI startup hook — runs forever for the life of
     the process. Unlike alert_checker.py's NSE loop, never registered with
     market_hours_scheduler: Delta has no after-hours to auto-stop for.
 
-    Tick-driven, same as alert_checker.py's NSE loop: wakes on
-    delta_ticker_manager.tick_event (set on every Delta WS tick) instead of
-    waiting the full POLL_INTERVAL_SECONDS — POLL_INTERVAL_SECONDS is now
-    just the safety-net ceiling (WS reconnect gap, etc.), not the real
-    cadence."""
-    from features.delta_exchange_ws import delta_ticker_manager
-
+    NO LONGER the real trigger path — on_underlying_tick() (called directly
+    from delta_exchange_ws.py's WS thread, token-routed per underlying) is.
+    This is now a slow reconcile/safety-net full scan every
+    POLL_INTERVAL_SECONDS, covering: a fresh alert not yet in the per-
+    underlying cache, a missed/failed WS-thread dispatch, and the gap right
+    after a WS reconnect before ticks resume. Deliberately no longer woken
+    by delta_ticker_manager.tick_event — waking (and rescanning BOTH BTC and
+    ETH) on every single Delta tick was exactly the O(total_alerts)-per-tick
+    cost the token-routed hot path replaces."""
+    _ensure_trigger_workers_started()
     while True:
         try:
             await asyncio.to_thread(_checker.run_cycle)
         except Exception:
             logger.exception("[delta_alert_checker] check cycle failed")
-        await asyncio.to_thread(delta_ticker_manager.tick_event.wait, POLL_INTERVAL_SECONDS)
-        delta_ticker_manager.tick_event.clear()
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
 async def start_delta_indicator_alert_scheduler_loop() -> None:

@@ -733,6 +733,7 @@ async def get_delta_move_options(instrument: str) -> dict:
     return {"status": "ok", "move_options": rows}
 
 
+
 # ── BTC/ETH chart alert checker — manual override ──────────────────────────
 # Both loops are already auto-started unconditionally at process boot
 # (api.py's _auto_start_delta_alert_checker) and never auto-stopped for

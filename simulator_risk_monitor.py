@@ -2784,3 +2784,63 @@ class SimulatorRiskMonitor:
 
 
 simulator_risk_monitor = SimulatorRiskMonitor()
+
+
+# HH:MM IST — daily cron-substitute trigger for the standalone expiry
+# square-off loop below. Deliberately after EXPIRY_SQUAREOFF_TIME (15:29,
+# the risk monitor's own warm-refresh cutoff) and after NSE/BSE's 15:30
+# close, so the broker ticker's cached LTP is that day's final traded price
+# by the time this fires.
+DAILY_SQUAREOFF_TRIGGER_IST = (15, 45)
+
+
+def _seconds_until_next_daily_trigger(now: datetime) -> float:
+    trigger = now.replace(
+        hour=DAILY_SQUAREOFF_TRIGGER_IST[0], minute=DAILY_SQUAREOFF_TRIGGER_IST[1],
+        second=0, microsecond=0,
+    )
+    if trigger <= now:
+        trigger += timedelta(days=1)
+    return (trigger - now).total_seconds()
+
+
+async def run_daily_expiry_squareoff_loop() -> None:
+    """
+    Always-on daily cron substitute for NSE/BSE expiry-day square-off —
+    independent of the full SimulatorRiskMonitor start/stop toggle (that
+    monitor defaults OFF on boot, server-capacity call 2026-08-26 — see
+    api.py's _simulator_monitors_market_hours_schedule docstring — so its
+    own 15:29 warm-refresh squareoff never fires unless someone visits
+    /simulator/risk-monitor/start). Mirrors
+    simulator/crypto_expiry_squareoff.py's run_crypto_expiry_squareoff_loop
+    shape: no polling, one asyncio.sleep() straight to the next
+    DAILY_SQUAREOFF_TRIGGER_IST, fire, repeat.
+
+    Reuses _auto_squareoff_expired_legs' existing warm-refresh path
+    (is_startup=False) as-is — that already closes each expired-today leg
+    at its current LTP from broker_ticker_manager.ltp_map, falling back to
+    entry_price only when no live tick is cached, and already carries the
+    per-strategy try/except isolation and the Free-plan
+    auto_position_management skip. Calling it on the shared
+    `simulator_risk_monitor` singleton is safe whether or not that
+    monitor's own start/stop loop is running — self.registry is built in
+    __init__, not in start().
+    """
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_daily_trigger(datetime.now(IST)))
+            log.info('[EXPIRY SQUAREOFF] daily %02d:%02d IST trigger firing',
+                      *DAILY_SQUAREOFF_TRIGGER_IST)
+            db = MongoData()
+            try:
+                await simulator_risk_monitor._auto_squareoff_expired_legs(db, is_startup=False)
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        except Exception:
+            log.exception('[EXPIRY SQUAREOFF] daily loop tick failed')
+            # Don't spin — back off before recomputing the next gap so a
+            # persistent failure can't turn this into a busy loop.
+            await asyncio.sleep(60)

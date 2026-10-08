@@ -93,7 +93,13 @@ class CryptoLiveOptionChainCollector:
             sleep_for = (next_minute - now).total_seconds()
             if self._stop_event.wait(timeout=max(sleep_for, 0.1)):
                 break
-            self._take_snapshot(next_minute.strftime("%Y-%m-%dT%H:%M:00Z"))
+            # One bad minute (Delta WS/REST glitch while building the chain)
+            # must not kill the thread — it never restarts on its own, so the
+            # straddle chart went empty until the next server restart.
+            try:
+                self._take_snapshot(next_minute.strftime("%Y-%m-%dT%H:%M:00Z"))
+            except Exception:
+                logger.exception("[CRYPTO LIVE COLLECTOR] snapshot failed for %s — continuing", next_minute)
 
     def _fetch_chain(self, underlying: str, expiry: str) -> dict | None:
         """Chain for one underlying+expiry — same live-WS-first,

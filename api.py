@@ -2203,6 +2203,22 @@ async def _auto_expiry_squareoff_catchup():
 
 
 @app.on_event("startup")
+async def _auto_start_nse_expiry_squareoff():
+    """Always-on daily 15:45 IST cron substitute for NSE/BSE expiry-day
+    square-off — see simulator_risk_monitor.run_daily_expiry_squareoff_loop's
+    docstring for why this exists as its own always-on loop rather than
+    relying on the full Simulator Risk Monitor (that one defaults OFF on
+    boot per _simulator_monitors_market_hours_schedule below, so its own
+    15:29 warm-refresh squareoff silently never fires unless someone starts
+    it manually). This loop is a single once-a-day DB query + LTP lookup,
+    not a hot loop, so it carries none of the capacity concern that keeps
+    the full risk monitor off by default."""
+    import asyncio
+    from simulator_risk_monitor import run_daily_expiry_squareoff_loop
+    asyncio.create_task(run_daily_expiry_squareoff_loop())
+
+
+@app.on_event("startup")
 async def _auto_start_crypto_expiry_squareoff():
     """Crypto's own expiry square-off — see simulator/crypto_expiry_squareoff.py's
     module docstring for why this is a separate always-on loop rather than a
@@ -2267,7 +2283,9 @@ async def _simulator_monitors_market_hours_schedule():
     Simulator Risk Monitor is no longer registered here — it defaults to
     OFF on boot (server capacity call, 2026-08-26); /simulator/risk-monitor/
     {start,stop} (and the Admin Monitors page) remain the only way to start
-    it, for whichever days/sessions it's actually needed.
+    it, for whichever days/sessions it's actually needed. Expiry-day
+    square-off does NOT depend on this monitor being started — see
+    _auto_start_nse_expiry_squareoff above, its own always-on daily loop.
     """
     asyncio.create_task(run_market_hours_scheduler(
         name="simulator-strategy-monitor",
@@ -3518,6 +3536,30 @@ async def simulator_risk_monitor_stop_post() -> dict:
 @sim_router.get("/simulator/risk-monitor/status")
 async def simulator_risk_monitor_status() -> dict:
     return simulator_risk_monitor.get_status()
+
+
+@sim_router.post("/simulator/risk-monitor/run-expiry-squareoff-now")
+async def simulator_risk_monitor_run_expiry_squareoff_now() -> dict:
+    """
+    On-demand manual trigger for today's-expiry paper-strategy square-off —
+    same _auto_squareoff_expired_legs warm-refresh path (current LTP from
+    broker_ticker_manager.ltp_map, entry_price fallback) that
+    run_daily_expiry_squareoff_loop fires automatically at 15:45 IST. Exists
+    so a stuck expiry-day leg can be closed right now instead of waiting for
+    the next scheduled trigger — e.g. right after deploying this loop for
+    the first time, with today's expiry already past 15:45. Independent of
+    whether the full SimulatorRiskMonitor start/stop loop is running.
+    """
+    db = MongoData()
+    try:
+        before = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        await simulator_risk_monitor._auto_squareoff_expired_legs(db, is_startup=False)
+        return {"status": "success", "triggered_at": before}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @sim_router.get("/simulator/health")
@@ -8036,6 +8078,13 @@ app.include_router(delta_live_chain_socket_router)
 # not the NSE chart's /ws/alert-events (shared/features/alert_events_socket.py).
 from simulator.delta_alert_events_socket import delta_alert_events_socket_router  # noqa: E402
 app.include_router(delta_alert_events_socket_router)
+# Push channel for the Analyse view's (AnalyseCryptoPaperTrade.tsx's
+# fetchExternalEntity) strategy/group/portfolio trade-history — replaces
+# that page's own 30s REST poll with the same shared-broadcaster-per-key
+# pattern as delta_live_chain_socket_router above (see that module's own
+# docstring for the "why").
+from simulator.analyse_entity_socket import analyse_entity_socket_router  # noqa: E402
+app.include_router(analyse_entity_socket_router)
 
 
 # ─── Kite Broker Endpoints ────────────────────────────────────────────────────
@@ -10912,7 +10961,7 @@ def _calculate_kite_basket_margin(db, legs: list[dict[str, Any]]) -> dict[str, A
         return None
 
 
-def _build_full_option_chain_response(instrument: str) -> dict[str, Any]:
+def _build_full_option_chain_response(instrument: str, expiry: str = "") -> dict[str, Any]:
     normalized_instrument = str(instrument or "").strip().upper()
     if not normalized_instrument:
         raise HTTPException(status_code=400, detail="Instrument is required")
@@ -10935,12 +10984,86 @@ def _build_full_option_chain_response(instrument: str) -> dict[str, Any]:
         )
 
     response = deepcopy(cached_base)
-    return {
-        **response,
-        "spot_price": _get_live_index_spot_price(normalized_instrument),
-    }
+    response["spot_price"] = _get_live_index_spot_price(normalized_instrument)
+    _overlay_live_option_chain_prices(response, normalized_instrument, expiry)
+    return response
 
 
+def _overlay_live_option_chain_prices(
+    response: dict[str, Any], instrument: str, expiry: str,
+) -> None:
+    """
+    Fill in live ltp/oi/greeks for one expiry's rows in-place, on top of the
+    static instrument-master structure built by _get_active_option_chain_cache
+    (every row starts at ltp=0.0 there).
+
+    Reuses option_chain_gateway.get_option_chain_snapshot (shared/features) —
+    Dhan's dedicated /v2/optionchain endpoint (every strike, both CE/PE,
+    Dhan's own Greeks, in ONE call), wrapped with the same cached +
+    single-flight pattern broker_gateway.py already proved out for
+    /marketfeed/quote, but keyed per (underlying, expiry) with Dhan's actual
+    3s-per-chain cooldown for this endpoint — see that module's docstring.
+    Best-effort: any failure here leaves the static (ltp=0.0) rows in place
+    rather than breaking the whole chain response.
+    """
+    normalized_expiry = str(expiry or "").strip()[:10]
+    if not normalized_expiry:
+        expiries = response.get("expiries") or []
+        normalized_expiry = expiries[0] if expiries else ""
+    if not normalized_expiry:
+        return
+
+    expiry_bucket = (response.get("grouped_option_chain") or {}).get(normalized_expiry)
+    if not expiry_bucket:
+        return
+
+    try:
+        from features.chart_data import DHAN_INDEX_SECURITY_IDS  # type: ignore
+        from features.option_chain_gateway import get_option_chain_snapshot  # type: ignore
+
+        underlying_security_id = DHAN_INDEX_SECURITY_IDS.get(instrument)
+        if not underlying_security_id:
+            return
+        live_chain = get_option_chain_snapshot(underlying_security_id, normalized_expiry, _shared_mongo._db)
+    except Exception as exc:
+        log.warning(
+            "[OPTION CHAIN] live overlay failed instrument=%s expiry=%s: %s",
+            instrument, normalized_expiry, exc,
+        )
+        return
+
+    live_by_strike = {row["strike"]: row for row in (live_chain.get("strikes") or [])}
+    for side, side_key in (("CE", "ce"), ("PE", "pe")):
+        for row in expiry_bucket.get(side) or []:
+            live_row = live_by_strike.get(float(row.get("strike") or 0.0))
+            if not live_row:
+                continue
+            live_side = live_row.get(side_key) or {}
+            if not live_side.get("ltp"):
+                continue
+            row["ltp"] = live_side.get("ltp", row.get("ltp", 0.0))
+            row["oi"] = live_side.get("oi", 0)
+            row["iv"] = live_side.get("iv")
+            row["delta"] = live_side.get("delta")
+            row["gamma"] = live_side.get("gamma")
+            row["theta"] = live_side.get("theta")
+            row["vega"] = live_side.get("vega")
+            row["bid"] = live_side.get("bid")
+            row["ask"] = live_side.get("ask")
+
+
+@app.get("/algo/get-option-chain/{instrument}")
+@app.get("/algo/get-opiton-chain/{instrument}")
+async def get_option_chain_algo(instrument: str, expiry: str = Query(default="")):
+    # off the event loop: _build_full_option_chain_response now does a live
+    # Dhan option-chain call, which can block on Dhan's rate gate.
+    return await asyncio.to_thread(_build_full_option_chain_response, instrument, expiry)
+
+
+@app.get("/get-option-chain/{instrument}")
+@app.get("/get-opiton-chain/{instrument}")
+async def get_option_chain(instrument: str, expiry: str = Query(default="")):
+    return await asyncio.to_thread(_build_full_option_chain_response, instrument, expiry)
 
 
 
